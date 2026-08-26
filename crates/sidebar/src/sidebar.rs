@@ -3532,26 +3532,8 @@ impl Sidebar {
             }
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
-                match &thread.workspace {
-                    ThreadEntryWorkspace::Open(workspace) => {
-                        let workspace = workspace.clone();
-                        self.activate_thread(metadata, &workspace, false, window, cx);
-                    }
-                    ThreadEntryWorkspace::Closed {
-                        folder_paths,
-                        project_group_key,
-                    } => {
-                        let folder_paths = folder_paths.clone();
-                        let project_group_key = project_group_key.clone();
-                        self.open_workspace_and_activate_thread(
-                            metadata,
-                            folder_paths,
-                            &project_group_key,
-                            window,
-                            cx,
-                        );
-                    }
-                }
+                let workspace = thread.workspace.clone();
+                self.open_thread_entry(metadata, workspace, false, window, cx);
             }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();
@@ -3948,6 +3930,158 @@ impl Sidebar {
         };
 
         self.activate_thread_in_other_window(metadata, workspace, target_window, cx);
+    }
+
+    fn open_thread_entry_unchecked(
+        &mut self,
+        metadata: ThreadMetadata,
+        workspace: ThreadEntryWorkspace,
+        retain: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match workspace {
+            ThreadEntryWorkspace::Open(workspace) => {
+                self.activate_thread(metadata, &workspace, retain, window, cx);
+            }
+            ThreadEntryWorkspace::Closed {
+                folder_paths,
+                project_group_key,
+            } => {
+                self.open_workspace_and_activate_thread(
+                    metadata,
+                    folder_paths,
+                    &project_group_key,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Opens a thread entry from the list, first verifying its folder paths
+    /// still exist on disk. A thread created in a linked worktree that has
+    /// since been deleted (e.g. through the git worktree picker) would
+    /// otherwise be opened against the missing directory, where the load
+    /// repeatedly fails and re-renders; missing folder paths are replaced by
+    /// the thread's recorded main worktree paths before activation instead.
+    fn open_thread_entry(
+        &mut self,
+        metadata: ThreadMetadata,
+        workspace: ThreadEntryWorkspace,
+        retain: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Remote paths can't be cheaply checked, and a thread that is already
+        // active in its open workspace only needs to be focused — skipping
+        // the async hop keeps the click flicker-free in that case.
+        let already_active = matches!(&workspace, ThreadEntryWorkspace::Open(open_workspace)
+            if self.is_thread_active_in_workspace(&metadata.thread_id, open_workspace, cx));
+        if metadata.remote_connection.is_some()
+            || already_active
+            || metadata.folder_paths().is_empty()
+        {
+            self.open_thread_entry_unchecked(metadata, workspace, retain, window, cx);
+            return;
+        }
+
+        let fs = <dyn fs::Fs>::global(cx);
+        let path_pairs: Vec<(PathBuf, PathBuf)> = metadata
+            .worktree_paths
+            .ordered_pairs()
+            .map(|(main_path, folder_path)| (main_path.clone(), folder_path.clone()))
+            .collect();
+        cx.spawn_in(window, async move |this, cx| {
+            let mut healed_paths = metadata.worktree_paths.clone();
+            let mut any_missing = false;
+            for (main_path, folder_path) in path_pairs {
+                if !matches!(fs.metadata(&folder_path).await, Ok(None)) {
+                    continue;
+                }
+                any_missing = true;
+                healed_paths.remove_folder_path(&folder_path);
+                if main_path != folder_path
+                    && matches!(fs.metadata(&main_path).await, Ok(Some(_)))
+                {
+                    healed_paths.add_path(&main_path, &main_path);
+                }
+            }
+
+            this.update_in(cx, |this, window, cx| {
+                if any_missing {
+                    this.open_thread_entry_with_healed_paths(
+                        metadata,
+                        healed_paths,
+                        retain,
+                        window,
+                        cx,
+                    );
+                } else {
+                    this.open_thread_entry_unchecked(metadata, workspace, retain, window, cx);
+                }
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
+    /// Re-points a thread whose folder paths no longer exist at the surviving
+    /// paths, persists the repaired metadata, and activates the thread there.
+    fn open_thread_entry_with_healed_paths(
+        &mut self,
+        metadata: ThreadMetadata,
+        healed_paths: WorktreePaths,
+        retain: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if healed_paths.is_empty() {
+            if let Some(workspace) = self.active_workspace(cx) {
+                Self::show_thread_title_toast(
+                    workspace,
+                    "The folder this thread was created in no longer exists.",
+                    cx,
+                );
+            }
+            return;
+        }
+
+        // Re-read the row before saving: the stat above ran asynchronously
+        // and the metadata clone may be stale (e.g. a concurrent rename).
+        let current = ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry(metadata.thread_id)
+            .cloned()
+            .unwrap_or(metadata);
+        let metadata = ThreadMetadata {
+            worktree_paths: healed_paths,
+            ..current
+        };
+        ThreadMetadataStore::global(cx).update(cx, |store, cx| {
+            store.save(metadata.clone(), cx);
+        });
+
+        let path_list = metadata.folder_paths().clone();
+        if let Some(workspace) = self.find_current_workspace_for_path_list(
+            &path_list,
+            metadata.remote_connection.as_ref(),
+            cx,
+        ) {
+            self.activate_thread_locally(&metadata, &workspace, retain, window, cx);
+        } else if let Some((target_window, workspace)) = self.find_open_workspace_for_path_list(
+            &path_list,
+            metadata.remote_connection.as_ref(),
+            cx,
+        ) {
+            self.activate_thread_in_other_window(metadata, workspace, target_window, cx);
+        } else {
+            let key = ProjectGroupKey::from_worktree_paths(
+                &metadata.worktree_paths,
+                metadata.remote_connection.clone(),
+            );
+            self.open_workspace_and_activate_thread(metadata, path_list, &key, window, cx);
+        }
     }
 
     fn open_workspace_and_activate_thread(
@@ -6312,23 +6446,13 @@ impl Sidebar {
                 let thread_workspace = thread_workspace.clone();
                 cx.listener(move |this, _, window, cx| {
                     this.selection = None;
-                    match &thread_workspace {
-                        ThreadEntryWorkspace::Open(workspace) => {
-                            this.activate_thread(metadata.clone(), workspace, false, window, cx);
-                        }
-                        ThreadEntryWorkspace::Closed {
-                            folder_paths,
-                            project_group_key,
-                        } => {
-                            this.open_workspace_and_activate_thread(
-                                metadata.clone(),
-                                folder_paths.clone(),
-                                project_group_key,
-                                window,
-                                cx,
-                            );
-                        }
-                    }
+                    this.open_thread_entry(
+                        metadata.clone(),
+                        thread_workspace.clone(),
+                        false,
+                        window,
+                        cx,
+                    );
                 })
             });
 
@@ -7105,26 +7229,8 @@ impl Sidebar {
         match &self.contents.entries[entry_ix] {
             ListEntry::Thread(thread) => {
                 let metadata = thread.metadata.clone();
-                match &thread.workspace {
-                    ThreadEntryWorkspace::Open(workspace) => {
-                        let workspace = workspace.clone();
-                        self.activate_thread(metadata, &workspace, true, window, cx);
-                    }
-                    ThreadEntryWorkspace::Closed {
-                        folder_paths,
-                        project_group_key,
-                    } => {
-                        let folder_paths = folder_paths.clone();
-                        let project_group_key = project_group_key.clone();
-                        self.open_workspace_and_activate_thread(
-                            metadata,
-                            folder_paths,
-                            &project_group_key,
-                            window,
-                            cx,
-                        );
-                    }
-                }
+                let workspace = thread.workspace.clone();
+                self.open_thread_entry(metadata, workspace, true, window, cx);
             }
             ListEntry::Terminal(terminal) => {
                 let metadata = terminal.metadata.clone();

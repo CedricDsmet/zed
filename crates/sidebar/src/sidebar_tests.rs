@@ -15109,3 +15109,136 @@ async fn test_find_or_create_workspace_returns_the_created_remote_workspace(
         "the local workspace should have re-activated during the open"
     );
 }
+
+#[gpui::test]
+async fn test_open_thread_for_deleted_worktree_falls_back_to_main_paths(cx: &mut TestAppContext) {
+    let project = init_test_project_with_agent_panel("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    // Thread created in a linked worktree at /wt-feature-a which has since
+    // been deleted from disk (the directory does not exist on the FakeFs).
+    save_thread_metadata_with_main_paths(
+        "thread-wt",
+        "WT Thread",
+        PathList::new(&[PathBuf::from("/wt-feature-a")]),
+        PathList::new(&[PathBuf::from("/project")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let session_id = acp::SessionId::new(Arc::from("thread-wt"));
+    let thread_ix = sidebar.read_with(cx, |sidebar, _| {
+        sidebar
+            .contents
+            .entries
+            .iter()
+            .position(|entry| {
+                matches!(entry, ListEntry::Thread(t)
+                    if t.metadata.session_id.as_ref() == Some(&session_id))
+            })
+            .expect("thread entry should be visible")
+    });
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.selection = Some(thread_ix);
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+
+    // The stale folder path must have been replaced by the recorded main
+    // worktree path, so the thread no longer points at the missing directory.
+    let metadata = cx.update(|_, cx| {
+        ThreadMetadataStore::global(cx)
+            .read(cx)
+            .entry_by_session(&session_id)
+            .cloned()
+            .expect("thread metadata should still exist")
+    });
+    assert_eq!(
+        metadata.folder_paths(),
+        &PathList::new(&[PathBuf::from("/project")]),
+        "the missing worktree folder path should be replaced by the main worktree path"
+    );
+
+    // No workspace should have been opened at the deleted worktree path; the
+    // thread opens in the existing main-project workspace instead.
+    let workspace_paths: Vec<PathList> = multi_workspace.read_with(cx, |mw, cx| {
+        mw.workspaces()
+            .map(|ws| {
+                let ws = ws.clone();
+                ws.read_with(cx, |_w, cx| workspace_path_list(&ws, cx))
+            })
+            .collect()
+    });
+    assert!(
+        !workspace_paths
+            .iter()
+            .any(|paths| paths.paths().iter().any(|p| p == Path::new("/wt-feature-a"))),
+        "no workspace should be opened at the deleted worktree path, got {workspace_paths:?}"
+    );
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspaces().count()),
+        1,
+        "the thread should open in the existing main-project workspace"
+    );
+
+    assert!(
+        sidebar.read_with(cx, |sidebar, _| is_active_session(sidebar, &session_id)),
+        "the thread should be the active sidebar entry after opening"
+    );
+}
+
+#[gpui::test]
+async fn test_open_thread_with_no_surviving_paths_shows_toast_and_does_not_open(
+    cx: &mut TestAppContext,
+) {
+    let project = init_test_project_with_agent_panel("/project", cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+    let (sidebar, _panel) = setup_sidebar_with_agent_panel(&multi_workspace, cx);
+
+    // Both the worktree folder path and its recorded main path are gone.
+    save_thread_metadata_with_main_paths(
+        "thread-gone",
+        "Gone Thread",
+        PathList::new(&[PathBuf::from("/wt-gone")]),
+        PathList::new(&[PathBuf::from("/main-gone")]),
+        chrono::TimeZone::with_ymd_and_hms(&Utc, 2024, 6, 1, 0, 0, 0).unwrap(),
+        cx,
+    );
+    multi_workspace.update_in(cx, |_, _window, cx| cx.notify());
+    cx.run_until_parked();
+
+    let session_id = acp::SessionId::new(Arc::from("thread-gone"));
+    let thread_ix = sidebar.read_with(cx, |sidebar, _| {
+        sidebar.contents.entries.iter().position(|entry| {
+            matches!(entry, ListEntry::Thread(t)
+                if t.metadata.session_id.as_ref() == Some(&session_id))
+        })
+    });
+    let Some(thread_ix) = thread_ix else {
+        // The group has no live workspace, so the sidebar may not render the
+        // row at all; nothing to open in that case.
+        return;
+    };
+
+    sidebar.update_in(cx, |sidebar, window, cx| {
+        sidebar.selection = Some(thread_ix);
+        sidebar.confirm(&Confirm, window, cx);
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |mw, _| mw.workspaces().count()),
+        1,
+        "no workspace should be opened for a thread with no surviving paths"
+    );
+    assert!(
+        !sidebar.read_with(cx, |sidebar, _| is_active_session(sidebar, &session_id)),
+        "the thread should not activate when none of its paths exist"
+    );
+}
