@@ -83,6 +83,12 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
     });
 }
 
+fn finish_replay(cx: &mut App) {
+    let globals = Vim::globals(cx);
+    globals.replayer.take();
+    globals.dot_replaying = false;
+}
+
 pub struct ReplayerState {
     actions: Vec<ReplayableAction>,
     running: bool,
@@ -149,9 +155,7 @@ impl Replayer {
             // this value is always reset, in the case that the focus is moved
             // away from the editor, effectively preventing the `EndRepeat`
             // action from being handled.
-            let globals = Vim::globals(cx);
-            globals.replayer.take();
-            globals.dot_replaying = false;
+            finish_replay(cx);
             return;
         };
         match action {
@@ -165,14 +169,19 @@ impl Replayer {
                 text,
                 utf16_range_to_replace,
             } => {
-                let Some(workspace) = Workspace::for_window(window, cx) else {
-                    return;
-                };
-                let Some(editor) = workspace
-                    .read(cx)
-                    .active_item(cx)
-                    .and_then(|item| item.act_as::<Editor>(cx))
-                else {
+                let editor = Workspace::for_window(window, cx).and_then(|workspace| {
+                    workspace
+                        .read(cx)
+                        .active_item(cx)
+                        .and_then(|item| item.act_as::<Editor>(cx))
+                });
+                // If the active item is no longer an editor (focus or the
+                // active item changed mid-replay), the deferred chain ends
+                // here. Without the cleanup, `dot_replaying` would stay set
+                // and the replayer would stay marked as running, wedging `.`
+                // until `vim::EndRepeat` is invoked manually.
+                let Some(editor) = editor else {
+                    finish_replay(cx);
                     return;
                 };
                 editor.update(cx, |editor, cx| {
