@@ -1031,6 +1031,9 @@
       "/": "project_panel::NewSearchInDirectory",
       "d": "project_panel::NewDirectory",
       "enter": "project_panel::OpenPermanent",
+      // Rebound here so that the `space …` chords above (`!Editor && !Terminal`)
+      // don't leave `space` pending for a second before the file opens.
+      "space": "project_panel::Open",
       "escape": "vim::ToggleProjectPanelFocus",
       "h": "project_panel::CollapseSelectedEntry",
       "j": "vim::MenuSelectNext",
