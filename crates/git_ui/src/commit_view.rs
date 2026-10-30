@@ -15,9 +15,9 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Subscription, Task,
-    WeakEntity, Window, actions,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyContext,
+    ParentElement, PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled,
+    Subscription, Task, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
@@ -578,9 +578,21 @@ impl CommitView {
                         DiffFileTreeEvent::OpenEntry(path_key) => {
                             this.scroll_to_path(path_key, window, cx);
                         }
+                        DiffFileTreeEvent::FocusEditor => {
+                            this.editor.focus_handle(cx).focus(window, cx);
+                        }
                     }
                 }),
-                cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+                cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
+                    diff_file_tree::focus_editor_if_hidden(
+                        &this.file_tree,
+                        this.shows_file_tree(cx),
+                        &this.editor.focus_handle(cx),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                }),
             ];
         (file_tree, subscriptions)
     }
@@ -599,13 +611,27 @@ impl CommitView {
                 );
             });
         });
-        self.editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn has_file_tree(&self, cx: &App) -> bool {
+        self.file_filter.is_none() && self.file_tree.read(cx).file_count() > 1
     }
 
     fn shows_file_tree(&self, cx: &App) -> bool {
-        self.file_filter.is_none()
-            && self.file_tree.read(cx).file_count() > 1
-            && GitPanelSettings::get_global(cx).diff_file_tree
+        self.has_file_tree(cx) && GitPanelSettings::get_global(cx).diff_file_tree
+    }
+
+    fn toggle_file_tree_focus(
+        &mut self,
+        _: &diff_file_tree::ToggleFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.has_file_tree(cx) {
+            cx.propagate();
+            return;
+        }
+        diff_file_tree::toggle_focus(&self.file_tree, &self.editor.focus_handle(cx), window, cx);
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -1466,10 +1492,16 @@ impl Item for CommitView {
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
+        let mut key_context = KeyContext::default();
+        key_context.add(if is_stash { "StashDiff" } else { "CommitDiff" });
+        if self.has_file_tree(cx) {
+            diff_file_tree::add_key_context(&mut key_context, self.shows_file_tree(cx));
+        }
 
         v_flex()
-            .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
+            .key_context(key_context)
             .on_action(cx.listener(Self::open_file_at_head_action))
+            .on_action(cx.listener(Self::toggle_file_tree_focus))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
@@ -1484,7 +1516,7 @@ impl Render for CommitView {
                             .min_h_0()
                             .w_full()
                             .when(self.shows_file_tree(cx), |this| {
-                                this.child(self.file_tree.clone())
+                                this.child(DiffFileTree::cached_view(self.file_tree.clone(), cx))
                             })
                             .child(div().flex_grow(1.).min_w_0().child(self.editor.clone())),
                     )
@@ -1536,8 +1568,7 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
-        let has_file_tree = commit_view_ref.file_filter.is_none()
-            && commit_view_ref.file_tree.read(cx).file_count() > 1;
+        let has_file_tree = commit_view_ref.has_file_tree(cx);
         let focus_handle = commit_view_ref.focus_handle(cx);
 
         h_flex()

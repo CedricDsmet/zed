@@ -1,6 +1,6 @@
 use crate::{
     conflict_view,
-    diff_file_tree::{DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent},
+    diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -15,8 +15,8 @@ use futures::{FutureExt as _, StreamExt as _, stream};
 use futures_lite::future::yield_now;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable, Render,
-    SharedString, Subscription, Task, WeakEntity,
+    App, AppContext as _, AsyncWindowContext, Entity, EventEmitter, FocusHandle, Focusable,
+    KeyContext, Render, SharedString, Subscription, Task, WeakEntity,
 };
 use language::{Anchor, Buffer, BufferId, Capability, OffsetRangeExt};
 use multi_buffer::{MultiBuffer, PathKey};
@@ -158,6 +158,15 @@ impl DiffMultibuffer {
             was_group_by = group_by;
             was_tree_view = tree_view;
             if diff_file_tree != was_diff_file_tree {
+                if let Some(file_tree) = &this.file_tree {
+                    crate::diff_file_tree::focus_editor_if_hidden(
+                        file_tree,
+                        diff_file_tree,
+                        &this.editor.focus_handle(cx),
+                        window,
+                        cx,
+                    );
+                }
                 cx.notify();
             }
             was_collapse_untracked_diff = is_collapse_untracked_diff;
@@ -206,6 +215,8 @@ impl DiffMultibuffer {
             |this, _file_tree, event, window, cx| match event {
                 DiffFileTreeEvent::OpenEntry(path_key) => {
                     this.move_to_path(path_key.clone(), window, cx);
+                }
+                DiffFileTreeEvent::FocusEditor => {
                     this.editor.focus_handle(cx).focus(window, cx);
                 }
             },
@@ -299,6 +310,10 @@ impl DiffMultibuffer {
         cx: &mut Context<Self>,
     ) {
         if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+            // Once the move has happened it must not be replayed: later diff
+            // updates for this file would otherwise yank the editor back here
+            // while the user is scrolling elsewhere.
+            self.pending_scroll = None;
             self.editor.update(cx, |editor, cx| {
                 editor.rhs_editor().update(cx, |editor, cx| {
                     editor.change_selections(
@@ -880,6 +895,19 @@ impl DiffMultibuffer {
         })
     }
 
+    fn toggle_file_tree_focus(
+        &mut self,
+        _: &diff_file_tree::ToggleFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(file_tree) = &self.file_tree else {
+            cx.propagate();
+            return;
+        };
+        diff_file_tree::toggle_focus(file_tree, &self.editor.focus_handle(cx), window, cx);
+    }
+
     #[cfg(test)]
     pub(crate) fn file_tree(&self) -> Option<&Entity<DiffFileTree>> {
         self.file_tree.as_ref()
@@ -960,10 +988,20 @@ impl Render for DiffMultibuffer {
             .file_tree
             .clone()
             .filter(|_| GitPanelSettings::get_global(cx).diff_file_tree);
+        let mut key_context = KeyContext::default();
+        if is_empty {
+            key_context.add("EmptyPane");
+        } else {
+            key_context.add("GitDiff");
+            if self.file_tree.is_some() {
+                diff_file_tree::add_key_context(&mut key_context, file_tree.is_some());
+            }
+        }
 
         div()
             .track_focus(&self.focus_handle)
-            .key_context(if is_empty { "EmptyPane" } else { "GitDiff" })
+            .key_context(key_context)
+            .on_action(cx.listener(Self::toggle_file_tree_focus))
             .bg(cx.theme().colors().editor_background)
             .flex()
             .items_center()
@@ -1025,7 +1063,7 @@ impl Render for DiffMultibuffer {
                 Some(file_tree) => el.child(
                     h_flex()
                         .size_full()
-                        .child(file_tree)
+                        .child(DiffFileTree::cached_view(file_tree, cx))
                         .child(div().flex_1().min_w_0().h_full().child(self.editor.clone())),
                 ),
                 None => el.child(self.editor.clone()),

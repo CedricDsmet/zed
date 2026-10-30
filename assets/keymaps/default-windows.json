@@ -1128,6 +1128,22 @@
     },
   },
   {
+    "context": "diff_file_tree",
+    "use_key_equivalents": true,
+    "bindings": {
+      "alt-g t": "git::ToggleDiffFileTree",
+      "alt-g f": "diff_file_tree::ToggleFocus",
+    },
+  },
+  {
+    "context": "DiffFileTree",
+    "use_key_equivalents": true,
+    "bindings": {
+      "left": "diff_file_tree::CollapseSelectedEntry",
+      "right": "diff_file_tree::ExpandSelectedEntry",
+    },
+  },
+  {
     "context": "GitDiff > Editor",
     "use_key_equivalents": true,
     "bindings": {

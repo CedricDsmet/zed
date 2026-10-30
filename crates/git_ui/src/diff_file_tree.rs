@@ -4,8 +4,9 @@ use collections::HashSet;
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
-    AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, Pixels, Stateful, Subscription,
-    UniformListScrollHandle, actions, px, uniform_list,
+    AnyElement, ClickEvent, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, KeyContext, Pixels, ScrollStrategy, Stateful, StyleRefinement, Subscription,
+    UniformListScrollHandle, actions, deferred, px, uniform_list,
 };
 use multi_buffer::PathKey;
 use settings::{Settings, SettingsStore};
@@ -22,6 +23,21 @@ actions!(
     [
         /// Shows or hides the file tree next to branch and commit diffs.
         ToggleDiffFileTree,
+    ]
+);
+
+actions!(
+    diff_file_tree,
+    [
+        /// Moves focus between the diff's file tree and its editor, showing the
+        /// file tree if it is hidden.
+        ToggleFocus,
+        /// Expands the selected directory in the diff's file tree, or shows the
+        /// selected file in the diff while keeping focus in the file tree.
+        ExpandSelectedEntry,
+        /// Collapses the selected directory in the diff's file tree, or selects
+        /// its parent directory.
+        CollapseSelectedEntry,
     ]
 );
 
@@ -53,9 +69,55 @@ pub(crate) fn render_toggle_button(focus_handle: &FocusHandle, cx: &App) -> Icon
         })
 }
 
+pub(crate) fn toggle_focus(
+    file_tree: &Entity<DiffFileTree>,
+    editor_focus_handle: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if file_tree.focus_handle(cx).contains_focused(window, cx) {
+        editor_focus_handle.focus(window, cx);
+        return;
+    }
+    if !GitPanelSettings::get_global(cx).diff_file_tree {
+        window.dispatch_action(Box::new(ToggleDiffFileTree), cx);
+    }
+    file_tree.update(cx, |file_tree, cx| file_tree.select_first_if_none(cx));
+    file_tree.focus_handle(cx).focus(window, cx);
+}
+
+/// Returns focus to the editor when the file tree is hidden while focused, so
+/// keyboard input doesn't end up in an element that is no longer rendered.
+pub(crate) fn focus_editor_if_hidden(
+    file_tree: &Entity<DiffFileTree>,
+    is_visible: bool,
+    editor_focus_handle: &FocusHandle,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if !is_visible && file_tree.focus_handle(cx).contains_focused(window, cx) {
+        editor_focus_handle.focus(window, cx);
+    }
+}
+
+pub(crate) fn add_key_context(key_context: &mut KeyContext, is_visible: bool) {
+    key_context.add("diff_file_tree");
+    if is_visible {
+        key_context.add("diff_file_tree_visible");
+    }
+}
+
 const TREE_INDENT: f32 = 16.0;
 const INDENT_GUIDE_LEFT_OFFSET: Pixels = px(19.);
-const FILE_TREE_WIDTH: Pixels = px(250.);
+const DEFAULT_FILE_TREE_WIDTH: Pixels = px(250.);
+const MIN_FILE_TREE_WIDTH: Pixels = px(150.);
+const MAX_FILE_TREE_WIDTH: Pixels = px(600.);
+const RESIZE_HANDLE_WIDTH: Pixels = px(6.);
+
+/// Carries the id of the tree being resized, since several trees can be
+/// visible at once (e.g. split commit views) and each listens for drag moves.
+#[derive(Clone)]
+struct DraggedDiffFileTreeEdge(EntityId);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DiffFileTreeEntry {
@@ -66,6 +128,7 @@ pub(crate) struct DiffFileTreeEntry {
 
 pub(crate) enum DiffFileTreeEvent {
     OpenEntry(PathKey),
+    FocusEditor,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -101,10 +164,18 @@ pub(crate) struct DiffFileTree {
     tree_view: bool,
     path_style: PathStyle,
     scroll_handle: UniformListScrollHandle,
+    width: Pixels,
+    focus_handle: FocusHandle,
     _settings_subscription: Subscription,
 }
 
 impl EventEmitter<DiffFileTreeEvent> for DiffFileTree {}
+
+impl Focusable for DiffFileTree {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
 
 impl DiffFileTree {
     pub(crate) fn new(path_style: PathStyle, cx: &mut Context<Self>) -> Self {
@@ -124,6 +195,8 @@ impl DiffFileTree {
             tree_view: GitPanelSettings::get_global(cx).tree_view,
             path_style,
             scroll_handle: UniformListScrollHandle::new(),
+            width: DEFAULT_FILE_TREE_WIDTH,
+            focus_handle: cx.focus_handle(),
             _settings_subscription: settings_subscription,
         }
     }
@@ -142,6 +215,15 @@ impl DiffFileTree {
         self.entries = entries;
         self.rebuild_rows();
         cx.notify();
+    }
+
+    /// Embeds the tree as a cached view. Uncached, it is re-rendered on every
+    /// frame the diff editor beside it scrolls, since both share a parent view.
+    pub(crate) fn cached_view(file_tree: Entity<Self>, cx: &App) -> impl IntoElement {
+        // A cached view is sized by this style rather than its contents, so the
+        // dragged width has to be applied here too.
+        let width = file_tree.read(cx).width;
+        file_tree.cached(StyleRefinement::default().flex_none().h_full().w(width))
     }
 
     pub(crate) fn file_count(&self) -> usize {
@@ -170,6 +252,13 @@ impl DiffFileTree {
         self.open_entry(entry_ix, cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn selected_path(&self) -> Option<String> {
+        self.selected
+            .as_ref()
+            .map(|path| path.as_unix_str().to_string())
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows = build_rows(&self.entries, self.tree_view, &self.collapsed_dirs);
     }
@@ -191,13 +280,204 @@ impl DiffFileTree {
         cx.notify();
     }
 
+    fn resize(&mut self, event: &DragMoveEvent<DraggedDiffFileTreeEdge>, cx: &mut Context<Self>) {
+        let is_this_tree = event
+            .dragged_item()
+            .downcast_ref::<DraggedDiffFileTreeEdge>()
+            .is_some_and(|dragged| dragged.0 == cx.entity_id());
+        if !is_this_tree {
+            return;
+        }
+        let width = (event.event.position.x - event.bounds.left())
+            .clamp(MIN_FILE_TREE_WIDTH, MAX_FILE_TREE_WIDTH);
+        if width != self.width {
+            self.width = width;
+            cx.notify();
+        }
+    }
+
+    fn render_resize_handle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity_id = cx.entity_id();
+        deferred(
+            div()
+                .id("diff-file-tree-resize-handle")
+                .absolute()
+                .top_0()
+                .right(-RESIZE_HANDLE_WIDTH / 2.)
+                .h_full()
+                .w(RESIZE_HANDLE_WIDTH)
+                .cursor_col_resize()
+                .on_drag(DraggedDiffFileTreeEdge(entity_id), |_, _, _, cx| {
+                    cx.stop_propagation();
+                    cx.new(|_| gpui::Empty)
+                })
+                .on_click(cx.listener(|this, event: &ClickEvent, _window, cx| {
+                    if event.click_count() >= 2 {
+                        this.width = DEFAULT_FILE_TREE_WIDTH;
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }))
+                .occlude(),
+        )
+    }
+
+    fn row_path<'a>(&'a self, row: &'a Row) -> Option<&'a RepoPath> {
+        match row {
+            Row::Directory { path, .. } => Some(path),
+            Row::File { entry_ix, .. } => self.entries.get(*entry_ix).map(|entry| &entry.repo_path),
+        }
+    }
+
+    fn selected_row_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.rows
+            .iter()
+            .position(|row| self.row_path(row) == Some(selected))
+    }
+
+    fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .rows
+            .get(row_ix)
+            .and_then(|row| self.row_path(row))
+            .cloned()
+        else {
+            return;
+        };
+        self.selected = Some(path);
+        self.scroll_handle
+            .scroll_to_item(row_ix, ScrollStrategy::Nearest);
+        cx.notify();
+    }
+
+    pub(crate) fn select_first_if_none(&mut self, cx: &mut Context<Self>) {
+        if self.selected_row_index().is_none() {
+            self.select_row(0, cx);
+        }
+    }
+
+    fn select_next(&mut self, _: &menu::SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        let next_ix = match self.selected_row_index() {
+            Some(row_ix) => (row_ix + 1).min(self.rows.len().saturating_sub(1)),
+            None => 0,
+        };
+        self.select_row(next_ix, cx);
+    }
+
+    fn select_previous(
+        &mut self,
+        _: &menu::SelectPrevious,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_ix = self
+            .selected_row_index()
+            .map_or(0, |row_ix| row_ix.saturating_sub(1));
+        self.select_row(previous_ix, cx);
+    }
+
+    fn select_first(&mut self, _: &menu::SelectFirst, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_row(0, cx);
+    }
+
+    fn select_last(&mut self, _: &menu::SelectLast, _: &mut Window, cx: &mut Context<Self>) {
+        self.select_row(self.rows.len().saturating_sub(1), cx);
+    }
+
+    fn confirm(&mut self, _: &menu::Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(row_ix) = self.selected_row_index() else {
+            return;
+        };
+        match self.rows.get(row_ix) {
+            Some(Row::Directory { path, .. }) => {
+                let path = path.clone();
+                self.toggle_directory(&path, cx);
+            }
+            Some(Row::File { entry_ix, .. }) => {
+                self.open_entry(*entry_ix, cx);
+                cx.emit(DiffFileTreeEvent::FocusEditor);
+            }
+            None => {}
+        }
+    }
+
+    fn cancel(&mut self, _: &menu::Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(DiffFileTreeEvent::FocusEditor);
+    }
+
+    fn expand_selected_entry(
+        &mut self,
+        _: &ExpandSelectedEntry,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row_ix) = self.selected_row_index() else {
+            self.select_row(0, cx);
+            return;
+        };
+        match self.rows.get(row_ix) {
+            Some(Row::Directory {
+                path,
+                expanded: false,
+                ..
+            }) => {
+                let path = path.clone();
+                self.toggle_directory(&path, cx);
+            }
+            Some(Row::Directory { expanded: true, .. }) => self.select_row(row_ix + 1, cx),
+            Some(Row::File { entry_ix, .. }) => self.open_entry(*entry_ix, cx),
+            None => {}
+        }
+    }
+
+    fn collapse_selected_entry(
+        &mut self,
+        _: &CollapseSelectedEntry,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(row_ix) = self.selected_row_index() else {
+            self.select_row(0, cx);
+            return;
+        };
+        let Some(row) = self.rows.get(row_ix) else {
+            return;
+        };
+        if let Row::Directory {
+            path,
+            expanded: true,
+            ..
+        } = row
+        {
+            let path = path.clone();
+            self.toggle_directory(&path, cx);
+            return;
+        }
+
+        let depth = row.depth();
+        let parent_ix = self.rows.get(..row_ix).and_then(|preceding_rows| {
+            preceding_rows.iter().rposition(|candidate| {
+                matches!(candidate, Row::Directory { .. }) && candidate.depth() < depth
+            })
+        });
+        if let Some(parent_ix) = parent_ix {
+            self.select_row(parent_ix, cx);
+        }
+    }
+
     fn visible_depths(&self, range: Range<usize>) -> SmallVec<[usize; 64]> {
         range
             .map(|ix| self.rows.get(ix).map_or(0, Row::depth))
             .collect()
     }
 
-    fn render_row(&self, ix: usize, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_row(
+        &self,
+        ix: usize,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let element = match self.rows.get(ix)? {
             Row::Directory {
                 path,
@@ -205,13 +485,14 @@ impl DiffFileTree {
                 depth,
                 expanded,
             } => {
+                let is_selected = self.selected.as_ref() == Some(path);
                 let path = path.clone();
                 let (chevron, folder) = if *expanded {
                     (IconName::ChevronDown, IconName::FolderOpen)
                 } else {
                     (IconName::ChevronRight, IconName::Folder)
                 };
-                self.render_row_container(ix, false, cx)
+                self.render_row_container(ix, is_selected, is_focused, cx)
                     .child(
                         h_flex()
                             .min_w_0()
@@ -238,6 +519,7 @@ impl DiffFileTree {
                             ),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
+                        this.selected = Some(path.clone());
                         this.toggle_directory(&path, cx);
                     }))
             }
@@ -264,7 +546,7 @@ impl DiffFileTree {
                     .size(IconSize::Small)
                     .color(Color::Muted);
 
-                self.render_row_container(ix, is_selected, cx)
+                self.render_row_container(ix, is_selected, is_focused, cx)
                     .child(
                         h_flex()
                             .min_w_0()
@@ -301,13 +583,20 @@ impl DiffFileTree {
                     .tooltip(Tooltip::text(full_path))
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
                         this.open_entry(entry_ix, cx);
+                        cx.emit(DiffFileTreeEvent::FocusEditor);
                     }))
             }
         };
         Some(element.into_any_element())
     }
 
-    fn render_row_container(&self, ix: usize, is_selected: bool, cx: &App) -> Stateful<Div> {
+    fn render_row_container(
+        &self,
+        ix: usize,
+        is_selected: bool,
+        is_focused: bool,
+        cx: &App,
+    ) -> Stateful<Div> {
         let colors = cx.theme().colors();
         h_flex()
             .id(("diff-file-tree-row", ix))
@@ -316,8 +605,12 @@ impl DiffFileTree {
             .min_w_0()
             .pl_2p5()
             .pr_1()
+            .border_1()
             .cursor_pointer()
             .when(is_selected, |this| this.bg(colors.ghost_element_selected))
+            .when(is_selected && is_focused, |this| {
+                this.border_color(colors.panel_focused_border)
+            })
             .hover(|style| style.bg(colors.ghost_element_hover))
             .active(|style| style.bg(colors.ghost_element_active))
     }
@@ -332,10 +625,23 @@ impl Render for DiffFileTree {
             format!("{file_count} files changed")
         };
 
+        let is_focused = self.focus_handle.contains_focused(window, cx);
+
         v_flex()
+            .relative()
+            .track_focus(&self.focus_handle)
+            .key_context("DiffFileTree")
+            .on_action(cx.listener(Self::select_next))
+            .on_action(cx.listener(Self::select_previous))
+            .on_action(cx.listener(Self::select_first))
+            .on_action(cx.listener(Self::select_last))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::expand_selected_entry))
+            .on_action(cx.listener(Self::collapse_selected_entry))
             .flex_none()
             .h_full()
-            .w(FILE_TREE_WIDTH)
+            .w(self.width)
             .border_r_1()
             .border_color(cx.theme().colors().border_variant)
             .bg(cx.theme().colors().panel_background)
@@ -360,9 +666,9 @@ impl Render for DiffFileTree {
                         uniform_list(
                             "diff-file-tree",
                             self.rows.len(),
-                            cx.processor(|this, range: Range<usize>, _window, cx| {
+                            cx.processor(move |this, range: Range<usize>, _window, cx| {
                                 range
-                                    .filter_map(|ix| this.render_row(ix, cx))
+                                    .filter_map(|ix| this.render_row(ix, is_focused, cx))
                                     .collect::<Vec<_>>()
                             }),
                         )
@@ -381,6 +687,8 @@ impl Render for DiffFileTree {
                     )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
+            .on_drag_move(cx.listener(|this, event, _window, cx| this.resize(event, cx)))
+            .child(self.render_resize_handle(cx))
     }
 }
 
