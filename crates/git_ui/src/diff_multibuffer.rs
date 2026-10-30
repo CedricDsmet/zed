@@ -193,9 +193,12 @@ impl DiffMultibuffer {
     /// Shows a list of the diff's files beside the editor, kept in sync on
     /// every refresh. Clicking a file scrolls the editor to it.
     pub(crate) fn show_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path_style = self.workspace.upgrade().map_or_else(PathStyle::local, |workspace| {
-            workspace.read(cx).project().read(cx).path_style(cx)
-        });
+        let path_style = self
+            .workspace
+            .upgrade()
+            .map_or_else(PathStyle::local, |workspace| {
+                workspace.read(cx).project().read(cx).path_style(cx)
+            });
         let file_tree = cx.new(|cx| DiffFileTree::new(path_style, cx));
         self._file_tree_subscription = Some(cx.subscribe_in(
             &file_tree,

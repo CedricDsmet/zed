@@ -381,21 +381,8 @@ impl CommitView {
                 path_key: commit_file_path_key(&file.path),
             })
             .collect();
-        let file_tree = cx.new(|cx| {
-            let mut file_tree = DiffFileTree::new(project.read(cx).path_style(cx), cx);
-            file_tree.set_entries(file_tree_entries, cx);
-            file_tree
-        });
-        let file_tree_subscription = cx.subscribe_in(
-            &file_tree,
-            window,
-            |this, _file_tree, event, window, cx| match event {
-                DiffFileTreeEvent::OpenEntry(path_key) => {
-                    this.scroll_to_path(path_key, window, cx);
-                }
-            },
-        );
-        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
+        let (file_tree, subscriptions) =
+            Self::new_file_tree(file_tree_entries, &project, window, cx);
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -569,8 +556,33 @@ impl CommitView {
             file_filter,
             file_tree,
             _load_diff_task: load_diff_task,
-            _subscriptions: vec![file_tree_subscription, settings_subscription],
+            _subscriptions: subscriptions,
         }
+    }
+
+    fn new_file_tree(
+        entries: Vec<DiffFileTreeEntry>,
+        project: &Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<DiffFileTree>, Vec<Subscription>) {
+        let file_tree = cx.new(|cx| {
+            let mut file_tree = DiffFileTree::new(project.read(cx).path_style(cx), cx);
+            file_tree.set_entries(entries, cx);
+            file_tree
+        });
+        let subscriptions =
+            vec![
+                cx.subscribe_in(&file_tree, window, |this, _file_tree, event, window, cx| {
+                    match event {
+                        DiffFileTreeEvent::OpenEntry(path_key) => {
+                            this.scroll_to_path(path_key, window, cx);
+                        }
+                    }
+                }),
+                cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
+            ];
+        (file_tree, subscriptions)
     }
 
     fn scroll_to_path(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
@@ -1390,6 +1402,9 @@ impl Item for CommitView {
         let multibuffer = self.multibuffer.clone();
         Task::ready(Some(cx.new(|cx| {
             let commit_view = cx.weak_entity();
+            let file_tree_entries = self.file_tree.read(cx).entries().to_vec();
+            let (file_tree, subscriptions) =
+                Self::new_file_tree(file_tree_entries, &self.project, window, cx);
             let editor = cx.new({
                 let file_statuses = file_statuses.clone();
                 let project = project.clone();
@@ -1440,7 +1455,9 @@ impl Item for CommitView {
                 remote: self.remote.clone(),
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
+                file_tree,
                 _load_diff_task: Task::ready(Ok(())),
+                _subscriptions: subscriptions,
             }
         })))
     }

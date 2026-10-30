@@ -49,7 +49,7 @@ pub(crate) fn render_toggle_button(focus_handle: &FocusHandle, cx: &App) -> Icon
             Tooltip::for_action_in(title, &ToggleDiffFileTree, &focus_handle, cx)
         })
         .on_click(|_, window, cx| {
-            window.dispatch_action(ToggleDiffFileTree.boxed_clone(), cx);
+            window.dispatch_action(Box::new(ToggleDiffFileTree), cx);
         })
 }
 
@@ -148,6 +148,10 @@ impl DiffFileTree {
         self.entries.len()
     }
 
+    pub(crate) fn entries(&self) -> &[DiffFileTreeEntry] {
+        &self.entries
+    }
+
     #[cfg(test)]
     pub(crate) fn entry_paths(&self) -> Vec<String> {
         self.entries
@@ -223,9 +227,7 @@ impl DiffFileTree {
                                             .color(Color::Muted),
                                     )
                                     .child(
-                                        Icon::new(folder)
-                                            .size(IconSize::Small)
-                                            .color(Color::Muted),
+                                        Icon::new(folder).size(IconSize::Small).color(Color::Muted),
                                     ),
                             )
                             .child(
