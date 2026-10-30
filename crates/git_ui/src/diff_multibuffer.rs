@@ -884,7 +884,12 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(file_tree) = &self.file_tree else {
+        // The tree is only rendered beside a non-empty diff.
+        let Some(file_tree) = self
+            .file_tree
+            .as_ref()
+            .filter(|_| !self.multibuffer.read(cx).is_empty())
+        else {
             cx.propagate();
             return;
         };

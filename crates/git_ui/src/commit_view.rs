@@ -625,7 +625,8 @@ impl CommitView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.has_file_tree(cx) {
+        // The tree is only rendered once the commit's first file has loaded.
+        if !self.has_file_tree(cx) || self.editor.read(cx).rhs_editor().read(cx).is_empty(cx) {
             cx.propagate();
             return;
         }

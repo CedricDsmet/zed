@@ -1451,6 +1451,54 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_branch_diff_file_tree_toggle_focus_ignored_without_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "a\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "a\n".into())],
+        );
+        cx.run_until_parked();
+        assert!(diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).excerpt_paths(cx).is_empty()
+        }));
+
+        let file_tree = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).file_tree().cloned().unwrap()
+        });
+        let file_tree_focus = file_tree.read_with(cx, |file_tree, cx| file_tree.focus_handle(cx));
+        let diff_focus = diff.read_with(cx, |diff, cx| diff.diff.read(cx).focus_handle(cx));
+        cx.update(|window, cx| diff_focus.focus(window, cx));
+
+        cx.dispatch_action(diff_file_tree::ToggleFocus);
+        assert!(!cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+        assert!(cx.update(|window, cx| diff_focus.contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
     async fn test_branch_diff_action_matches_existing_item_by_base_ref(cx: &mut TestAppContext) {
         init_test(cx);
 
