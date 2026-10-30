@@ -1,5 +1,6 @@
 use crate::{
     conflict_view,
+    diff_file_tree::{DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -30,7 +31,7 @@ use settings::{GitPanelGroupBy, GitPanelSortBy, Settings, SettingsStore};
 use std::{collections::BTreeMap, sync::Arc};
 use theme::ActiveTheme;
 use ui::{CommonAnimationExt as _, KeyBinding, prelude::*};
-use util::{ResultExt as _, rel_path::RelPath};
+use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
 use workspace::{
     CloseActiveItem, ItemNavHistory, Workspace,
     item::{Item, SaveOptions},
@@ -59,6 +60,8 @@ pub struct DiffMultibuffer {
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
     empty_label: SharedString,
+    file_tree: Option<Entity<DiffFileTree>>,
+    _file_tree_subscription: Option<Subscription>,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -131,12 +134,14 @@ impl DiffMultibuffer {
         let mut was_tree_view = GitPanelSettings::get_global(cx).tree_view;
         let mut was_collapse_untracked_diff =
             GitPanelSettings::get_global(cx).collapse_untracked_diff;
+        let mut was_diff_file_tree = GitPanelSettings::get_global(cx).diff_file_tree;
         cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
             let settings = GitPanelSettings::get_global(cx);
             let sort_by = settings.sort_by;
             let group_by = settings.group_by;
             let tree_view = settings.tree_view;
             let is_collapse_untracked_diff = settings.collapse_untracked_diff;
+            let diff_file_tree = settings.diff_file_tree;
             if sort_by != was_sort_by
                 || group_by != was_group_by
                 || tree_view != was_tree_view
@@ -152,7 +157,11 @@ impl DiffMultibuffer {
             was_sort_by = sort_by;
             was_group_by = group_by;
             was_tree_view = tree_view;
+            if diff_file_tree != was_diff_file_tree {
+                cx.notify();
+            }
             was_collapse_untracked_diff = is_collapse_untracked_diff;
+            was_diff_file_tree = diff_file_tree;
         })
         .detach();
 
@@ -171,12 +180,34 @@ impl DiffMultibuffer {
             pending_scroll: None,
             review_comment_count: 0,
             empty_label: empty_label.into(),
+            file_tree: None,
+            _file_tree_subscription: None,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
                 Subscription::join(editor_subscription, review_comment_subscription),
             ),
         }
+    }
+
+    /// Shows a list of the diff's files beside the editor, kept in sync on
+    /// every refresh. Clicking a file scrolls the editor to it.
+    pub(crate) fn show_file_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path_style = self.workspace.upgrade().map_or_else(PathStyle::local, |workspace| {
+            workspace.read(cx).project().read(cx).path_style(cx)
+        });
+        let file_tree = cx.new(|cx| DiffFileTree::new(path_style, cx));
+        self._file_tree_subscription = Some(cx.subscribe_in(
+            &file_tree,
+            window,
+            |this, _file_tree, event, window, cx| match event {
+                DiffFileTreeEvent::OpenEntry(path_key) => {
+                    this.move_to_path(path_key.clone(), window, cx);
+                    this.editor.focus_handle(cx).focus(window, cx);
+                }
+            },
+        ));
+        self.file_tree = Some(file_tree);
     }
 
     pub(crate) fn diff_base<'a>(&'a self, cx: &'a App) -> &'a DiffBase {
@@ -654,6 +685,18 @@ impl DiffMultibuffer {
                 }
             }
 
+            if let Some(file_tree) = &this.file_tree {
+                let tree_entries = entries
+                    .iter()
+                    .map(|(path_key, diff_buffer)| DiffFileTreeEntry {
+                        repo_path: diff_buffer.repo_path.clone(),
+                        status: diff_buffer.file_status,
+                        path_key: path_key.clone(),
+                    })
+                    .collect();
+                file_tree.update(cx, |file_tree, cx| file_tree.set_entries(tree_entries, cx));
+            }
+
             let repo_path_by_display_id = this
                 .buffer_subscriptions
                 .iter()
@@ -834,6 +877,11 @@ impl DiffMultibuffer {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn file_tree(&self) -> Option<&Entity<DiffFileTree>> {
+        self.file_tree.as_ref()
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn excerpt_paths(&self, cx: &App) -> Vec<std::sync::Arc<util::rel_path::RelPath>> {
         let snapshot = self
@@ -905,6 +953,10 @@ impl Render for DiffMultibuffer {
         let is_empty = self.multibuffer.read(cx).is_empty();
         let is_loading = self.branch_diff.read(cx).is_tree_base_loading() || !self._task.is_ready();
         let empty_label = self.empty_label.clone();
+        let file_tree = self
+            .file_tree
+            .clone()
+            .filter(|_| GitPanelSettings::get_global(cx).diff_file_tree);
 
         div()
             .track_focus(&self.focus_handle)
@@ -966,7 +1018,15 @@ impl Render for DiffMultibuffer {
                         ),
                 )
             })
-            .when(!is_empty, |el| el.child(self.editor.clone()))
+            .when(!is_empty, |el| match file_tree {
+                Some(file_tree) => el.child(
+                    h_flex()
+                        .size_full()
+                        .child(file_tree)
+                        .child(div().flex_1().min_w_0().h_full().child(self.editor.clone())),
+                ),
+                None => el.child(self.editor.clone()),
+            })
     }
 }
 

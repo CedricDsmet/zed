@@ -1149,6 +1149,10 @@
     //
     // Default: true
     "diff_stats": true,
+    // Whether to show a file tree next to branch and commit diffs.
+    //
+    // Default: true
+    "diff_file_tree": true,
     // Maximum length of the commit message title before a warning is shown.
     // Set to 0 to disable.
     //

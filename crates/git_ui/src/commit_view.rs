@@ -3,7 +3,8 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
+    scroll::Autoscroll,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
@@ -15,8 +16,8 @@ use git::{
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
-    Window, actions,
+    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Subscription, Task,
+    WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
@@ -28,7 +29,7 @@ use project::{
     Project, ProjectPath, WorktreeId,
     git_store::{CommitDiff, Repository, UnshallowState},
 };
-use settings::{DiffViewStyle, Settings};
+use settings::{DiffViewStyle, Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
@@ -46,7 +47,9 @@ use workspace::{
 };
 
 use crate::commit_tooltip::CommitAvatar;
+use crate::diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent};
 use crate::git_panel::GitPanel;
+use crate::git_panel_settings::GitPanelSettings;
 
 actions!(
     git,
@@ -87,7 +90,9 @@ pub struct CommitView {
     remote: Option<GitRemote>,
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
+    file_tree: Entity<DiffFileTree>,
     _load_diff_task: Task<Result<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub(crate) struct GitBlob {
@@ -178,6 +183,24 @@ impl Addon for CommitDiffAddon {
 }
 
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
+
+fn commit_file_path_key(path: &RelPath) -> PathKey {
+    PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, path.into_arc())
+}
+
+fn commit_file_status(is_created: bool, is_deleted: bool) -> FileStatus {
+    let status_code = if is_created {
+        StatusCode::Added
+    } else if is_deleted {
+        StatusCode::Deleted
+    } else {
+        StatusCode::Modified
+    };
+    FileStatus::Tracked(TrackedStatus {
+        index_status: status_code,
+        worktree_status: StatusCode::Unmodified,
+    })
+}
 
 impl CommitView {
     pub fn open(
@@ -349,6 +372,31 @@ impl CommitView {
         let repository_clone = repository.clone();
         let project_clone = project.clone();
 
+        let file_tree_entries = commit_diff
+            .files
+            .iter()
+            .map(|file| DiffFileTreeEntry {
+                repo_path: file.path.clone(),
+                status: commit_file_status(file.old_text.is_none(), file.new_text.is_none()),
+                path_key: commit_file_path_key(&file.path),
+            })
+            .collect();
+        let file_tree = cx.new(|cx| {
+            let mut file_tree = DiffFileTree::new(project.read(cx).path_style(cx), cx);
+            file_tree.set_entries(file_tree_entries, cx);
+            file_tree
+        });
+        let file_tree_subscription = cx.subscribe_in(
+            &file_tree,
+            window,
+            |this, _file_tree, event, window, cx| match event {
+                DiffFileTreeEvent::OpenEntry(path_key) => {
+                    this.scroll_to_path(path_key, window, cx);
+                }
+            },
+        );
+        let settings_subscription = cx.observe_global::<SettingsStore>(|_, cx| cx.notify());
+
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
@@ -398,20 +446,7 @@ impl CommitView {
                 let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
                 let buffer_id = cx.update(|_, cx| buffer.read(cx).remote_id())?;
 
-                let status_code = if is_created {
-                    StatusCode::Added
-                } else if is_deleted {
-                    StatusCode::Deleted
-                } else {
-                    StatusCode::Modified
-                };
-                file_statuses.insert(
-                    buffer_id,
-                    FileStatus::Tracked(TrackedStatus {
-                        index_status: status_code,
-                        worktree_status: StatusCode::Unmodified,
-                    }),
-                );
+                file_statuses.insert(buffer_id, commit_file_status(is_created, is_deleted));
 
                 if is_binary {
                     binary_buffer_ids.insert(buffer_id);
@@ -435,10 +470,7 @@ impl CommitView {
 
                 let (excerpt_ranges, path) = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
-                    let path = PathKey::with_sort_prefix(
-                        FILE_NAMESPACE_SORT_PREFIX,
-                        snapshot.file().unwrap().path().clone(),
-                    );
+                    let path = commit_file_path_key(snapshot.file().unwrap().path());
                     let ranges = if is_binary {
                         vec![language::Point::zero()..snapshot.max_point()]
                     } else {
@@ -535,8 +567,33 @@ impl CommitView {
             remote,
             is_shallow_boundary,
             file_filter,
+            file_tree,
             _load_diff_task: load_diff_task,
+            _subscriptions: vec![file_tree_subscription, settings_subscription],
         }
+    }
+
+    fn scroll_to_path(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(position) = self.multibuffer.read(cx).location_for_path(path_key, cx) else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.rhs_editor().update(cx, |editor, cx| {
+                editor.change_selections(
+                    SelectionEffects::scroll(Autoscroll::focused()),
+                    window,
+                    cx,
+                    |selections| selections.select_ranges([position..position]),
+                );
+            });
+        });
+        self.editor.focus_handle(cx).focus(window, cx);
+    }
+
+    fn shows_file_tree(&self, cx: &App) -> bool {
+        self.file_filter.is_none()
+            && self.file_tree.read(cx).file_count() > 1
+            && GitPanelSettings::get_global(cx).diff_file_tree
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -1401,7 +1458,20 @@ impl Render for CommitView {
             .child(self.render_header(window, cx))
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
-                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
+                |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_grow(1.)
+                            .min_h_0()
+                            .w_full()
+                            .when(self.shows_file_tree(cx), |this| {
+                                this.child(self.file_tree.clone())
+                            })
+                            .child(div().flex_grow(1.).min_w_0().child(self.editor.clone())),
+                    )
+                },
             )
             .when(self.is_shallow_boundary, |this| {
                 this.child(self.render_shallow_boundary_notice(cx))
@@ -1449,6 +1519,9 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
+        let has_file_tree = commit_view_ref.file_filter.is_none()
+            && commit_view_ref.file_tree.read(cx).file_count() > 1;
+        let focus_handle = commit_view_ref.focus_handle(cx);
 
         h_flex()
             .gap_1()
@@ -1463,6 +1536,9 @@ impl Render for CommitViewToolbar {
                         ))
                         .child(Divider::vertical()),
                 )
+            })
+            .when(has_file_tree, |this| {
+                this.child(diff_file_tree::render_toggle_button(&focus_handle, cx))
             })
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)

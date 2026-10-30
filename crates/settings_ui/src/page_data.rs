@@ -6767,6 +6767,25 @@ fn panels_page() -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Diff File Tree",
+                description: "Whether to show a file tree next to branch and commit diffs.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("git_panel.diff_file_tree"),
+                    pick: |settings_content| {
+                        settings_content.git_panel.as_ref()?.diff_file_tree.as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .git_panel
+                            .get_or_insert_default()
+                            .diff_file_tree = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Primary Click Behavior",
                 description: "Default action when clicking a changed file in the Git panel.",
                 field: Box::new(SettingField {
