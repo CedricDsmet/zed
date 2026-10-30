@@ -3,8 +3,7 @@ use buffer_diff::BufferDiff;
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, HiddenDiffHunkRenderer, MultiBuffer,
-    SelectionEffects, SplittableEditor, hover_markdown_style, multibuffer_context_lines,
-    scroll::Autoscroll,
+    SplittableEditor, hover_markdown_style, multibuffer_context_lines,
 };
 use futures_lite::future::yield_now;
 use git::repository::{CommitDetails, RepoPath};
@@ -47,7 +46,7 @@ use workspace::{
 };
 
 use crate::commit_tooltip::CommitAvatar;
-use crate::diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent};
+use crate::diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry};
 use crate::git_panel::GitPanel;
 use crate::git_panel_settings::GitPanelSettings;
 
@@ -91,6 +90,7 @@ pub struct CommitView {
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
     file_tree: Entity<DiffFileTree>,
+    pending_scroll: Option<PathKey>,
     _load_diff_task: Task<Result<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -381,8 +381,14 @@ impl CommitView {
                 path_key: commit_file_path_key(&file.path),
             })
             .collect();
-        let (file_tree, subscriptions) =
-            Self::new_file_tree(file_tree_entries, &project, window, cx);
+        let (file_tree, subscriptions) = Self::new_file_tree(
+            file_tree_entries,
+            &editor,
+            &multibuffer,
+            &project,
+            window,
+            cx,
+        );
 
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -555,6 +561,7 @@ impl CommitView {
             is_shallow_boundary,
             file_filter,
             file_tree,
+            pending_scroll: None,
             _load_diff_task: load_diff_task,
             _subscriptions: subscriptions,
         }
@@ -562,6 +569,8 @@ impl CommitView {
 
     fn new_file_tree(
         entries: Vec<DiffFileTreeEntry>,
+        editor: &Entity<SplittableEditor>,
+        multibuffer: &Entity<MultiBuffer>,
         project: &Entity<Project>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -571,46 +580,35 @@ impl CommitView {
             file_tree.set_entries(entries, cx);
             file_tree
         });
-        let subscriptions =
-            vec![
-                cx.subscribe_in(&file_tree, window, |this, _file_tree, event, window, cx| {
-                    match event {
-                        DiffFileTreeEvent::OpenEntry(path_key) => {
-                            this.scroll_to_path(path_key, window, cx);
-                        }
-                        DiffFileTreeEvent::FocusEditor => {
-                            this.editor.focus_handle(cx).focus(window, cx);
-                        }
-                    }
-                }),
-                cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
-                    diff_file_tree::focus_editor_if_hidden(
-                        &this.file_tree,
-                        this.shows_file_tree(cx),
-                        &this.editor.focus_handle(cx),
-                        window,
-                        cx,
-                    );
-                    cx.notify();
-                }),
-            ];
+        let subscriptions = vec![
+            diff_file_tree::subscribe(&file_tree, editor, window, cx, Self::move_to_path),
+            // Large commits add their files in batches, so a file picked in
+            // the tree before its excerpt exists is scrolled to once it does.
+            cx.observe_in(multibuffer, window, |this, _multibuffer, window, cx| {
+                if let Some(path_key) = this.pending_scroll.take() {
+                    this.move_to_path(path_key, window, cx);
+                }
+            }),
+            cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
+                diff_file_tree::focus_editor_if_hidden(
+                    &this.file_tree,
+                    this.shows_file_tree(cx),
+                    &this.editor.focus_handle(cx),
+                    window,
+                    cx,
+                );
+                cx.notify();
+            }),
+        ];
         (file_tree, subscriptions)
     }
 
-    fn scroll_to_path(&mut self, path_key: &PathKey, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(position) = self.multibuffer.read(cx).location_for_path(path_key, cx) else {
-            return;
-        };
-        self.editor.update(cx, |editor, cx| {
-            editor.rhs_editor().update(cx, |editor, cx| {
-                editor.change_selections(
-                    SelectionEffects::scroll(Autoscroll::focused()),
-                    window,
-                    cx,
-                    |selections| selections.select_ranges([position..position]),
-                );
-            });
-        });
+    fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        if diff_file_tree::scroll_editor_to_path(&self.editor, &path_key, window, cx) {
+            self.pending_scroll = None;
+        } else {
+            self.pending_scroll = Some(path_key);
+        }
     }
 
     fn has_file_tree(&self, cx: &App) -> bool {
@@ -1428,14 +1426,12 @@ impl Item for CommitView {
         let multibuffer = self.multibuffer.clone();
         Task::ready(Some(cx.new(|cx| {
             let commit_view = cx.weak_entity();
-            let file_tree_entries = self.file_tree.read(cx).entries().to_vec();
-            let (file_tree, subscriptions) =
-                Self::new_file_tree(file_tree_entries, &self.project, window, cx);
             let editor = cx.new({
                 let file_statuses = file_statuses.clone();
                 let project = project.clone();
                 let workspace_entity = workspace_entity.clone();
                 let multibuffer = multibuffer.clone();
+                let window = &mut *window;
                 move |cx| {
                     let editor = SplittableEditor::new(
                         diff_view_style,
@@ -1458,6 +1454,15 @@ impl Item for CommitView {
                     editor
                 }
             });
+            let file_tree_entries = self.file_tree.read(cx).entries().to_vec();
+            let (file_tree, subscriptions) = Self::new_file_tree(
+                file_tree_entries,
+                &editor,
+                &multibuffer,
+                &self.project,
+                window,
+                cx,
+            );
             let language_registry = project.read(cx).languages().clone();
             let message = cx.new(|cx| {
                 Markdown::new(
@@ -1482,6 +1487,7 @@ impl Item for CommitView {
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
                 file_tree,
+                pending_scroll: None,
                 _load_diff_task: Task::ready(Ok(())),
                 _subscriptions: subscriptions,
             }
@@ -1669,7 +1675,98 @@ mod tests {
     use gpui::{EmptyView, TestAppContext};
     use indoc::indoc;
     use language::{Language, LanguageConfig, LanguageMatcher, markdown_lang};
+    use multi_buffer::ToPoint as _;
+    use project::{FakeFs, git_store::CommitFile};
+    use serde_json::json;
     use settings::SettingsStore;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_file_tree_scrolls_to_file_loaded_after_click(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project has a repository");
+
+        let files = (0..3)
+            .map(|ix| CommitFile {
+                path: RepoPath::new(&format!("file{ix}.txt")).unwrap(),
+                old_text: Some("old\n".into()),
+                new_text: Some("new\n".into()),
+                is_binary: false,
+            })
+            .collect();
+        let commit = CommitDetails {
+            sha: "a".repeat(40).into(),
+            message: "message".into(),
+            commit_timestamp: 0,
+            author_email: "author@example.com".into(),
+            author_name: "Author".into(),
+        };
+        let commit_view = workspace.update_in(cx, |_workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let workspace = cx.weak_entity();
+            cx.new(|cx| {
+                CommitView::new(
+                    commit,
+                    CommitDiff {
+                        files,
+                        is_shallow_boundary: false,
+                    },
+                    repository,
+                    project.clone(),
+                    workspace_entity,
+                    workspace,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        let file_tree = commit_view.read_with(cx, |commit_view, _| commit_view.file_tree.clone());
+        file_tree.update(cx, |file_tree, cx| file_tree.open_path("file2.txt", cx));
+        cx.run_until_parked();
+
+        commit_view.read_with(cx, |commit_view, cx| {
+            let path_key = commit_file_path_key(&RepoPath::new("file2.txt").unwrap());
+            let snapshot = commit_view.multibuffer.read(cx).snapshot(cx);
+            let file_start = commit_view
+                .multibuffer
+                .read(cx)
+                .location_for_path(&path_key, cx)
+                .expect("file2.txt has been loaded")
+                .to_point(&snapshot);
+            let cursor = commit_view
+                .editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot);
+            assert_eq!(cursor, file_start);
+        });
+    }
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {

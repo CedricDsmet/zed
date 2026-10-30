@@ -1,6 +1,6 @@
 use crate::{
     conflict_view,
-    diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry, DiffFileTreeEvent},
+    diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry},
     git_panel::{GitPanel, GitStatusEntry},
     git_panel_settings::GitPanelSettings,
 };
@@ -209,17 +209,12 @@ impl DiffMultibuffer {
                 workspace.read(cx).project().read(cx).path_style(cx)
             });
         let file_tree = cx.new(|cx| DiffFileTree::new(path_style, cx));
-        self._file_tree_subscription = Some(cx.subscribe_in(
+        self._file_tree_subscription = Some(diff_file_tree::subscribe(
             &file_tree,
+            &self.editor,
             window,
-            |this, _file_tree, event, window, cx| match event {
-                DiffFileTreeEvent::OpenEntry(path_key) => {
-                    this.move_to_path(path_key.clone(), window, cx);
-                }
-                DiffFileTreeEvent::FocusEditor => {
-                    this.editor.focus_handle(cx).focus(window, cx);
-                }
-            },
+            cx,
+            Self::move_to_path,
         ));
         self.file_tree = Some(file_tree);
     }
@@ -309,23 +304,11 @@ impl DiffMultibuffer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(position) = self.multibuffer.read(cx).location_for_path(&path_key, cx) {
+        if diff_file_tree::scroll_editor_to_path(&self.editor, &path_key, window, cx) {
             // Once the move has happened it must not be replayed: later diff
             // updates for this file would otherwise yank the editor back here
             // while the user is scrolling elsewhere.
             self.pending_scroll = None;
-            self.editor.update(cx, |editor, cx| {
-                editor.rhs_editor().update(cx, |editor, cx| {
-                    editor.change_selections(
-                        SelectionEffects::scroll(Autoscroll::focused()),
-                        window,
-                        cx,
-                        |s| {
-                            s.select_ranges([position..position]);
-                        },
-                    )
-                })
-            });
         } else {
             self.pending_scroll = Some(path_key);
         }

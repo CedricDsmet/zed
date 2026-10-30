@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use collections::HashSet;
+use editor::{SelectionEffects, SplittableEditor, scroll::Autoscroll};
 use file_icons::FileIcons;
 use git::{repository::RepoPath, status::FileStatus};
 use gpui::{
@@ -84,6 +85,56 @@ pub(crate) fn toggle_focus(
     }
     file_tree.update(cx, |file_tree, cx| file_tree.select_first_if_none(cx));
     file_tree.focus_handle(cx).focus(window, cx);
+}
+
+pub(crate) fn subscribe<T: 'static>(
+    file_tree: &Entity<DiffFileTree>,
+    editor: &Entity<SplittableEditor>,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    open_path: impl Fn(&mut T, PathKey, &mut Window, &mut Context<T>) + 'static,
+) -> Subscription {
+    let editor = editor.downgrade();
+    cx.subscribe_in(
+        file_tree,
+        window,
+        move |this, _file_tree, event, window, cx| match event {
+            DiffFileTreeEvent::OpenEntry(path_key) => open_path(this, path_key.clone(), window, cx),
+            DiffFileTreeEvent::FocusEditor => {
+                if let Some(editor) = editor.upgrade() {
+                    editor.focus_handle(cx).focus(window, cx);
+                }
+            }
+        },
+    )
+}
+
+/// Returns false when the file's excerpt hasn't been added to the editor yet,
+/// so the caller can retry once it has.
+pub(crate) fn scroll_editor_to_path(
+    editor: &Entity<SplittableEditor>,
+    path_key: &PathKey,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let rhs_editor = editor.read(cx).rhs_editor().clone();
+    let Some(position) = rhs_editor
+        .read(cx)
+        .buffer()
+        .read(cx)
+        .location_for_path(path_key, cx)
+    else {
+        return false;
+    };
+    rhs_editor.update(cx, |editor, cx| {
+        editor.change_selections(
+            SelectionEffects::scroll(Autoscroll::focused()),
+            window,
+            cx,
+            |selections| selections.select_ranges([position..position]),
+        );
+    });
+    true
 }
 
 /// Returns focus to the editor when the file tree is hidden while focused, so
