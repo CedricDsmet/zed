@@ -196,10 +196,28 @@ pub(crate) enum DiffFileTreeEvent {
     FocusEditor,
 }
 
+/// Identifies a row. The diff editor groups files by the path key's sort
+/// prefix (e.g. conflicts before other changes), and each group gets its own
+/// tree, so a directory can have a row in several groups.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RowKey {
+    sort_prefix: Option<u64>,
+    path: RepoPath,
+}
+
+impl RowKey {
+    fn for_entry(entry: &DiffFileTreeEntry) -> Self {
+        Self {
+            sort_prefix: entry.path_key.sort_prefix,
+            path: entry.repo_path.clone(),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum Row {
     Directory {
-        path: RepoPath,
+        key: RowKey,
         name: SharedString,
         depth: usize,
         expanded: bool,
@@ -224,8 +242,8 @@ impl Row {
 pub(crate) struct DiffFileTree {
     entries: Vec<DiffFileTreeEntry>,
     rows: Vec<Row>,
-    collapsed_dirs: HashSet<RepoPath>,
-    selected: Option<RepoPath>,
+    collapsed_dirs: HashSet<RowKey>,
+    selected: Option<RowKey>,
     tree_view: bool,
     path_style: PathStyle,
     scroll_handle: UniformListScrollHandle,
@@ -274,7 +292,9 @@ impl DiffFileTree {
         cx: &mut Context<Self>,
     ) {
         // The diff editor orders its excerpts by path key, so sorting the same
-        // way keeps the list in the order the files appear in the editor.
+        // way keeps the list in the order the files appear in the editor. In
+        // tree view that holds for branch diffs, whose path keys sort folders
+        // first, but not for commit views, which sort by plain path.
         entries.sort_by(|a, b| a.path_key.cmp(&b.path_key));
         if entries == self.entries {
             return;
@@ -323,16 +343,16 @@ impl DiffFileTree {
     pub(crate) fn selected_path(&self) -> Option<String> {
         self.selected
             .as_ref()
-            .map(|path| path.as_unix_str().to_string())
+            .map(|key| key.path.as_unix_str().to_string())
     }
 
     fn rebuild_rows(&mut self) {
         self.rows = build_rows(&self.entries, self.tree_view, &self.collapsed_dirs);
     }
 
-    fn toggle_directory(&mut self, path: &RepoPath, cx: &mut Context<Self>) {
-        if !self.collapsed_dirs.remove(path) {
-            self.collapsed_dirs.insert(path.clone());
+    fn toggle_directory(&mut self, key: &RowKey, cx: &mut Context<Self>) {
+        if !self.collapsed_dirs.remove(key) {
+            self.collapsed_dirs.insert(key.clone());
         }
         self.rebuild_rows();
         cx.notify();
@@ -342,7 +362,7 @@ impl DiffFileTree {
         let Some(entry) = self.entries.get(entry_ix) else {
             return;
         };
-        self.selected = Some(entry.repo_path.clone());
+        self.selected = Some(RowKey::for_entry(entry));
         cx.emit(DiffFileTreeEvent::OpenEntry(entry.path_key.clone()));
         cx.notify();
     }
@@ -389,10 +409,10 @@ impl DiffFileTree {
         )
     }
 
-    fn row_path<'a>(&'a self, row: &'a Row) -> Option<&'a RepoPath> {
+    fn row_key(&self, row: &Row) -> Option<RowKey> {
         match row {
-            Row::Directory { path, .. } => Some(path),
-            Row::File { entry_ix, .. } => self.entries.get(*entry_ix).map(|entry| &entry.repo_path),
+            Row::Directory { key, .. } => Some(key.clone()),
+            Row::File { entry_ix, .. } => self.entries.get(*entry_ix).map(RowKey::for_entry),
         }
     }
 
@@ -400,19 +420,14 @@ impl DiffFileTree {
         let selected = self.selected.as_ref()?;
         self.rows
             .iter()
-            .position(|row| self.row_path(row) == Some(selected))
+            .position(|row| self.row_key(row).as_ref() == Some(selected))
     }
 
     fn select_row(&mut self, row_ix: usize, cx: &mut Context<Self>) {
-        let Some(path) = self
-            .rows
-            .get(row_ix)
-            .and_then(|row| self.row_path(row))
-            .cloned()
-        else {
+        let Some(key) = self.rows.get(row_ix).and_then(|row| self.row_key(row)) else {
             return;
         };
-        self.selected = Some(path);
+        self.selected = Some(key);
         self.scroll_handle
             .scroll_to_item(row_ix, ScrollStrategy::Nearest);
         cx.notify();
@@ -457,9 +472,9 @@ impl DiffFileTree {
             return;
         };
         match self.rows.get(row_ix) {
-            Some(Row::Directory { path, .. }) => {
-                let path = path.clone();
-                self.toggle_directory(&path, cx);
+            Some(Row::Directory { key, .. }) => {
+                let key = key.clone();
+                self.toggle_directory(&key, cx);
             }
             Some(Row::File { entry_ix, .. }) => {
                 self.open_entry(*entry_ix, cx);
@@ -485,12 +500,12 @@ impl DiffFileTree {
         };
         match self.rows.get(row_ix) {
             Some(Row::Directory {
-                path,
+                key,
                 expanded: false,
                 ..
             }) => {
-                let path = path.clone();
-                self.toggle_directory(&path, cx);
+                let key = key.clone();
+                self.toggle_directory(&key, cx);
             }
             Some(Row::Directory { expanded: true, .. }) => self.select_row(row_ix + 1, cx),
             Some(Row::File { entry_ix, .. }) => self.open_entry(*entry_ix, cx),
@@ -512,13 +527,13 @@ impl DiffFileTree {
             return;
         };
         if let Row::Directory {
-            path,
+            key,
             expanded: true,
             ..
         } = row
         {
-            let path = path.clone();
-            self.toggle_directory(&path, cx);
+            let key = key.clone();
+            self.toggle_directory(&key, cx);
             return;
         }
 
@@ -547,13 +562,13 @@ impl DiffFileTree {
     ) -> Option<AnyElement> {
         let element = match self.rows.get(ix)? {
             Row::Directory {
-                path,
+                key,
                 name,
                 depth,
                 expanded,
             } => {
-                let is_selected = self.selected.as_ref() == Some(path);
-                let path = path.clone();
+                let is_selected = self.selected.as_ref() == Some(key);
+                let key = key.clone();
                 let (chevron, folder) = if *expanded {
                     (IconName::ChevronDown, IconName::FolderOpen)
                 } else {
@@ -586,14 +601,14 @@ impl DiffFileTree {
                             ),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _window, cx| {
-                        this.selected = Some(path.clone());
-                        this.toggle_directory(&path, cx);
+                        this.selected = Some(key.clone());
+                        this.toggle_directory(&key, cx);
                     }))
             }
             Row::File { entry_ix, depth } => {
                 let entry_ix = *entry_ix;
                 let entry = self.entries.get(entry_ix)?;
-                let is_selected = self.selected.as_ref() == Some(&entry.repo_path);
+                let is_selected = self.selected.as_ref() == Some(&RowKey::for_entry(entry));
                 let is_deleted = entry.status.is_deleted();
                 let full_path: SharedString =
                     entry.repo_path.display(self.path_style).to_string().into();
@@ -762,7 +777,7 @@ impl Render for DiffFileTree {
 fn build_rows(
     entries: &[DiffFileTreeEntry],
     tree_view: bool,
-    collapsed_dirs: &HashSet<RepoPath>,
+    collapsed_dirs: &HashSet<RowKey>,
 ) -> Vec<Row> {
     if !tree_view {
         return (0..entries.len())
@@ -770,16 +785,28 @@ fn build_rows(
             .collect();
     }
 
-    let root = TreeNode::build(entries.iter().enumerate(), |(_, entry)| &entry.repo_path);
     let mut rows = Vec::new();
-    push_rows(&root, 0, collapsed_dirs, &mut rows);
+    let mut group_start = 0;
+    for group in entries.chunk_by(|a, b| a.path_key.sort_prefix == b.path_key.sort_prefix) {
+        let sort_prefix = group.first().and_then(|entry| entry.path_key.sort_prefix);
+        let root = TreeNode::build(
+            group
+                .iter()
+                .enumerate()
+                .map(|(ix, entry)| (group_start + ix, entry)),
+            |(_, entry)| &entry.repo_path,
+        );
+        push_rows(&root, sort_prefix, 0, collapsed_dirs, &mut rows);
+        group_start += group.len();
+    }
     rows
 }
 
 fn push_rows(
     node: &TreeNode<(usize, &DiffFileTreeEntry)>,
+    sort_prefix: Option<u64>,
     depth: usize,
-    collapsed_dirs: &HashSet<RepoPath>,
+    collapsed_dirs: &HashSet<RowKey>,
     rows: &mut Vec<Row>,
 ) {
     for child in node.children.values() {
@@ -787,15 +814,16 @@ fn push_rows(
         let Some(path) = path else {
             continue;
         };
-        let expanded = !collapsed_dirs.contains(&path);
+        let key = RowKey { sort_prefix, path };
+        let expanded = !collapsed_dirs.contains(&key);
         rows.push(Row::Directory {
-            path,
+            key,
             name,
             depth,
             expanded,
         });
         if expanded {
-            push_rows(terminal, depth + 1, collapsed_dirs, rows);
+            push_rows(terminal, sort_prefix, depth + 1, collapsed_dirs, rows);
         }
     }
 
@@ -810,9 +838,13 @@ mod tests {
     use git::status::{StatusCode, TrackedStatus};
 
     fn entry(path: &str) -> DiffFileTreeEntry {
+        grouped_entry(0, path)
+    }
+
+    fn grouped_entry(sort_prefix: u64, path: &str) -> DiffFileTreeEntry {
         let repo_path = RepoPath::new(path).unwrap();
         DiffFileTreeEntry {
-            path_key: PathKey::with_sort_prefix(0, repo_path.into_arc()),
+            path_key: PathKey::with_sort_prefix(sort_prefix, repo_path.into_arc()),
             repo_path,
             status: FileStatus::Tracked(TrackedStatus {
                 index_status: StatusCode::Modified,
@@ -878,7 +910,10 @@ mod tests {
             entry("README.md"),
         ];
         let mut collapsed = HashSet::default();
-        collapsed.insert(RepoPath::new("crates/editor/src").unwrap());
+        collapsed.insert(RowKey {
+            sort_prefix: Some(0),
+            path: RepoPath::new("crates/editor/src").unwrap(),
+        });
 
         let rows = build_rows(&entries, true, &collapsed);
         assert_eq!(
@@ -889,6 +924,30 @@ mod tests {
                 "  v git/src/",
                 "    git.rs",
                 "README.md",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_rows_tree_per_sort_prefix_group() {
+        let entries = vec![
+            grouped_entry(0, "src/conflict.rs"),
+            grouped_entry(1, "README.md"),
+            grouped_entry(1, "src/tracked.rs"),
+            grouped_entry(2, "src/new.rs"),
+        ];
+
+        let rows = build_rows(&entries, true, &HashSet::default());
+        assert_eq!(
+            describe(&entries, &rows),
+            vec![
+                "v src/",
+                "  conflict.rs",
+                "v src/",
+                "  tracked.rs",
+                "README.md",
+                "v src/",
+                "  new.rs",
             ]
         );
     }

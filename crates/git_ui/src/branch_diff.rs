@@ -1347,19 +1347,20 @@ mod tests {
         cx.simulate_keystrokes("ctrl-w h");
         cx.run_until_parked();
         assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
-        assert_eq!(selected_path(cx).as_deref(), Some("src"));
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
 
-        cx.simulate_keystrokes("j");
+        cx.simulate_keystrokes("j j");
         assert_eq!(selected_path(cx).as_deref(), Some("src/b.txt"));
 
         // Collapsing from a file selects its parent, then collapses the parent.
         cx.simulate_keystrokes("h");
         assert_eq!(selected_path(cx).as_deref(), Some("src"));
         cx.simulate_keystrokes("h j");
-        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+        assert_eq!(selected_path(cx).as_deref(), Some("src"));
 
         cx.dispatch_action(menu::SelectPrevious);
-        assert_eq!(selected_path(cx).as_deref(), Some("src"));
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+        cx.dispatch_action(menu::SelectNext);
         cx.simulate_keystrokes("l l");
         assert_eq!(selected_path(cx).as_deref(), Some("src/b.txt"));
         cx.dispatch_action(menu::SelectNext);
@@ -1371,7 +1372,7 @@ mod tests {
         assert_eq!(active_path(cx).as_deref(), Some("src/c.txt"));
         assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
 
-        cx.dispatch_action(menu::SelectLast);
+        cx.dispatch_action(menu::SelectFirst);
         assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
         cx.dispatch_action(menu::Confirm);
         cx.run_until_parked();
