@@ -1352,7 +1352,6 @@ mod tests {
         cx.simulate_keystrokes("j j");
         assert_eq!(selected_path(cx).as_deref(), Some("src/b.txt"));
 
-        // Collapsing from a file selects its parent, then collapses the parent.
         cx.simulate_keystrokes("h");
         assert_eq!(selected_path(cx).as_deref(), Some("src"));
         cx.simulate_keystrokes("h j");
@@ -1366,7 +1365,6 @@ mod tests {
         cx.dispatch_action(menu::SelectNext);
         assert_eq!(selected_path(cx).as_deref(), Some("src/c.txt"));
 
-        // Expanding a file shows it in the diff without leaving the tree.
         cx.simulate_keystrokes("l");
         cx.run_until_parked();
         assert_eq!(active_path(cx).as_deref(), Some("src/c.txt"));
