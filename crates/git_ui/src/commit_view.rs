@@ -589,15 +589,23 @@ impl CommitView {
                     this.move_to_path(path_key, window, cx);
                 }
             }),
-            cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
-                diff_file_tree::sync_focus(
-                    &this.file_tree,
-                    this.shows_file_tree(cx),
-                    &this.editor.focus_handle(cx),
-                    window,
-                    cx,
-                );
-                cx.notify();
+            cx.observe_global_in::<SettingsStore>(window, {
+                let mut was_enabled = GitPanelSettings::get_global(cx).diff_file_tree;
+                move |this, window, cx| {
+                    let is_enabled = GitPanelSettings::get_global(cx).diff_file_tree;
+                    if is_enabled == was_enabled {
+                        return;
+                    }
+                    was_enabled = is_enabled;
+                    diff_file_tree::sync_focus(
+                        &this.file_tree,
+                        this.shows_file_tree(cx),
+                        &this.editor.focus_handle(cx),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                }
             }),
         ];
         (file_tree, subscriptions)
