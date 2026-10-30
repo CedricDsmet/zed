@@ -1064,6 +1064,10 @@ impl<T> TreeNode<T> {
         root
     }
 
+    pub(crate) fn path(&self) -> Option<&RepoPath> {
+        self.path.as_ref()
+    }
+
     /// Follows directories holding nothing but a single subdirectory, so they
     /// can be shown as one row ("a/b/c"). Returns the last directory of the
     /// chain, the row's name, and the last directory's path.

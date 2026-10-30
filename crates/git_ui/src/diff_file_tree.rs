@@ -810,8 +810,11 @@ fn push_rows(
     rows: &mut Vec<Row>,
 ) {
     for child in node.children.values() {
-        let (terminal, name, path) = child.compact_directory_chain();
-        let Some(path) = path else {
+        let (terminal, name, _) = child.compact_directory_chain();
+        // Keyed by the chain's first directory rather than its last: adding or
+        // removing files can change how far a chain compacts, but its first
+        // directory stays a row, so collapse and selection state survive.
+        let Some(path) = child.path().cloned() else {
             continue;
         };
         let key = RowKey { sort_prefix, path };
@@ -912,7 +915,7 @@ mod tests {
         let mut collapsed = HashSet::default();
         collapsed.insert(RowKey {
             sort_prefix: Some(0),
-            path: RepoPath::new("crates/editor/src").unwrap(),
+            path: RepoPath::new("crates/editor").unwrap(),
         });
 
         let rows = build_rows(&entries, true, &collapsed);
@@ -925,6 +928,36 @@ mod tests {
                 "    git.rs",
                 "README.md",
             ]
+        );
+    }
+
+    #[test]
+    fn test_build_rows_collapsed_directory_survives_compaction_change() {
+        let mut collapsed = HashSet::default();
+        collapsed.insert(RowKey {
+            sort_prefix: Some(0),
+            path: RepoPath::new("crates/editor").unwrap(),
+        });
+
+        let entries = vec![
+            entry("crates/editor/editor.rs"),
+            entry("crates/editor/src/element.rs"),
+            entry("crates/git/git.rs"),
+        ];
+        let rows = build_rows(&entries, true, &collapsed);
+        assert_eq!(
+            describe(&entries, &rows),
+            vec!["v crates/", "  > editor/", "  v git/", "    git.rs"]
+        );
+
+        let entries = vec![
+            entry("crates/editor/src/element.rs"),
+            entry("crates/git/git.rs"),
+        ];
+        let rows = build_rows(&entries, true, &collapsed);
+        assert_eq!(
+            describe(&entries, &rows),
+            vec!["v crates/", "  > editor/src/", "  v git/", "    git.rs"]
         );
     }
 
