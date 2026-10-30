@@ -428,6 +428,7 @@ impl CommitView {
                     .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
                 let display_name = format!("{short_sha} - {file_name}");
 
+                let path = commit_file_path_key(&file.path);
                 let file = Arc::new(GitBlob {
                     path: file.path.clone(),
                     is_deleted,
@@ -461,10 +462,9 @@ impl CommitView {
                     build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
                 };
 
-                let (excerpt_ranges, path) = cx.update(|_, cx| {
+                let excerpt_ranges = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
-                    let path = commit_file_path_key(snapshot.file().unwrap().path());
-                    let ranges = if is_binary {
+                    if is_binary {
                         vec![language::Point::zero()..snapshot.max_point()]
                     } else {
                         let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
@@ -476,8 +476,7 @@ impl CommitView {
                                 .map(|hunk| hunk.buffer_range.to_point(&snapshot))
                                 .collect::<Vec<_>>()
                         }
-                    };
-                    (ranges, path)
+                    }
                 })?;
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
