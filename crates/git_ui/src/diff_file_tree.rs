@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, ops::Range};
+use std::ops::Range;
 
 use collections::HashSet;
 use editor::{SelectionEffects, SplittableEditor, scroll::Autoscroll};
@@ -14,10 +14,10 @@ use settings::{Settings, SettingsStore};
 use smallvec::SmallVec;
 use theme::ActiveTheme;
 use ui::{IndentGuideColors, Tooltip, WithScrollbar, prelude::*};
-use util::{ResultExt as _, paths::PathStyle};
+use util::paths::PathStyle;
 use workspace::Workspace;
 
-use crate::{git_panel_settings::GitPanelSettings, git_status_icon};
+use crate::{git_panel::TreeNode, git_panel_settings::GitPanelSettings, git_status_icon};
 
 actions!(
     git,
@@ -743,12 +743,6 @@ impl Render for DiffFileTree {
     }
 }
 
-#[derive(Default)]
-struct TreeNode<'a> {
-    children: BTreeMap<&'a str, TreeNode<'a>>,
-    files: Vec<usize>,
-}
-
 fn build_rows(
     entries: &[DiffFileTreeEntry],
     tree_view: bool,
@@ -760,63 +754,36 @@ fn build_rows(
             .collect();
     }
 
-    let mut root = TreeNode::default();
-    for (entry_ix, entry) in entries.iter().enumerate() {
-        let mut node = &mut root;
-        if let Some(parent) = entry.repo_path.parent() {
-            for component in parent.components() {
-                node = node.children.entry(component).or_default();
-            }
-        }
-        node.files.push(entry_ix);
-    }
-
+    let root = TreeNode::build(entries.iter().enumerate(), |(_, entry)| &entry.repo_path);
     let mut rows = Vec::new();
-    push_rows(&root, "", 0, collapsed_dirs, &mut rows);
+    push_rows(&root, 0, collapsed_dirs, &mut rows);
     rows
 }
 
 fn push_rows(
-    node: &TreeNode<'_>,
-    parent_path: &str,
+    node: &TreeNode<(usize, &DiffFileTreeEntry)>,
     depth: usize,
     collapsed_dirs: &HashSet<RepoPath>,
     rows: &mut Vec<Row>,
 ) {
-    for (name, mut child) in &node.children {
-        // Directories holding nothing but a single subdirectory are shown as
-        // one row ("a/b/c"), like the Git panel does.
-        let mut name = name.to_string();
-        while child.files.is_empty() && child.children.len() == 1 {
-            let Some((grandchild_name, grandchild)) = child.children.iter().next() else {
-                break;
-            };
-            name.push('/');
-            name.push_str(grandchild_name);
-            child = grandchild;
-        }
-
-        let path = if parent_path.is_empty() {
-            name.clone()
-        } else {
-            format!("{parent_path}/{name}")
-        };
-        let Some(repo_path) = RepoPath::new(&path).log_err() else {
+    for child in node.children.values() {
+        let (terminal, name, path) = child.compact_directory_chain();
+        let Some(path) = path else {
             continue;
         };
-        let expanded = !collapsed_dirs.contains(&repo_path);
+        let expanded = !collapsed_dirs.contains(&path);
         rows.push(Row::Directory {
-            path: repo_path,
-            name: name.into(),
+            path,
+            name,
             depth,
             expanded,
         });
         if expanded {
-            push_rows(child, &path, depth + 1, collapsed_dirs, rows);
+            push_rows(terminal, depth + 1, collapsed_dirs, rows);
         }
     }
 
-    for &entry_ix in &node.files {
+    for &(entry_ix, _) in &node.files {
         rows.push(Row::File { entry_ix, depth });
     }
 }
