@@ -590,7 +590,7 @@ impl CommitView {
                 }
             }),
             cx.observe_global_in::<SettingsStore>(window, |this, window, cx| {
-                diff_file_tree::focus_editor_if_hidden(
+                diff_file_tree::sync_focus(
                     &this.file_tree,
                     this.shows_file_tree(cx),
                     &this.editor.focus_handle(cx),

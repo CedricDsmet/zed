@@ -159,7 +159,7 @@ impl DiffMultibuffer {
             was_tree_view = tree_view;
             if diff_file_tree != was_diff_file_tree {
                 if let Some(file_tree) = &this.file_tree {
-                    crate::diff_file_tree::focus_editor_if_hidden(
+                    crate::diff_file_tree::sync_focus(
                         file_tree,
                         diff_file_tree,
                         &this.editor.focus_handle(cx),

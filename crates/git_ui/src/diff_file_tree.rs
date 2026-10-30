@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::{mem, ops::Range};
 
 use collections::HashSet;
 use editor::{SelectionEffects, SplittableEditor, scroll::Autoscroll};
@@ -80,10 +80,15 @@ pub(crate) fn toggle_focus(
         editor_focus_handle.focus(window, cx);
         return;
     }
-    if !GitPanelSettings::get_global(cx).diff_file_tree {
-        window.dispatch_action(Box::new(ToggleDiffFileTree), cx);
-    }
     file_tree.update(cx, |file_tree, cx| file_tree.select_first_if_none(cx));
+    if !GitPanelSettings::get_global(cx).diff_file_tree {
+        // Showing the tree writes the settings file asynchronously. Focusing the
+        // tree before it renders would send keystrokes nowhere, so the editor
+        // keeps focus until `sync_focus` sees the tree shown.
+        file_tree.update(cx, |file_tree, _| file_tree.focus_when_shown = true);
+        window.dispatch_action(Box::new(ToggleDiffFileTree), cx);
+        return;
+    }
     file_tree.focus_handle(cx).focus(window, cx);
 }
 
@@ -137,16 +142,25 @@ pub(crate) fn scroll_editor_to_path(
     true
 }
 
-/// Returns focus to the editor when the file tree is hidden while focused, so
-/// keyboard input doesn't end up in an element that is no longer rendered.
-pub(crate) fn focus_editor_if_hidden(
+/// Called when the tree's visibility may have changed. Returns focus to the
+/// editor when the tree is hidden while focused, so keyboard input doesn't end
+/// up in an element that is no longer rendered, and focuses the tree once it
+/// is shown by `toggle_focus`.
+pub(crate) fn sync_focus(
     file_tree: &Entity<DiffFileTree>,
     is_visible: bool,
     editor_focus_handle: &FocusHandle,
     window: &mut Window,
     cx: &mut App,
 ) {
-    if !is_visible && file_tree.focus_handle(cx).contains_focused(window, cx) {
+    if is_visible {
+        let focus_when_shown = file_tree.update(cx, |file_tree, _| {
+            mem::take(&mut file_tree.focus_when_shown)
+        });
+        if focus_when_shown {
+            file_tree.focus_handle(cx).focus(window, cx);
+        }
+    } else if file_tree.focus_handle(cx).contains_focused(window, cx) {
         editor_focus_handle.focus(window, cx);
     }
 }
@@ -217,6 +231,7 @@ pub(crate) struct DiffFileTree {
     scroll_handle: UniformListScrollHandle,
     width: Pixels,
     focus_handle: FocusHandle,
+    focus_when_shown: bool,
     _settings_subscription: Subscription,
 }
 
@@ -248,6 +263,7 @@ impl DiffFileTree {
             scroll_handle: UniformListScrollHandle::new(),
             width: DEFAULT_FILE_TREE_WIDTH,
             focus_handle: cx.focus_handle(),
+            focus_when_shown: false,
             _settings_subscription: settings_subscription,
         }
     }
