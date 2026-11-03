@@ -14,9 +14,9 @@ use git::{
 };
 use gpui::{
     AnyElement, App, AppContext as _, AsyncWindowContext, ClipboardItem, Context, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, ParentElement,
-    PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled, Task, WeakEntity,
-    Window, actions,
+    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyContext,
+    ParentElement, PromptLevel, Render, ScrollHandle, StatefulInteractiveElement as _, Styled,
+    Subscription, Task, WeakEntity, Window, actions,
 };
 use language::{
     Buffer, Capability, DiskState, File, LanguageRegistry, LineEnding, OffsetRangeExt as _,
@@ -28,7 +28,7 @@ use project::{
     Project, ProjectPath, WorktreeId,
     git_store::{CommitDiff, Repository, UnshallowState},
 };
-use settings::{DiffViewStyle, Settings};
+use settings::{DiffViewStyle, Settings, SettingsStore};
 use std::{
     any::{Any, TypeId},
     collections::HashSet,
@@ -46,7 +46,9 @@ use workspace::{
 };
 
 use crate::commit_tooltip::CommitAvatar;
+use crate::diff_file_tree::{self, DiffFileTree, DiffFileTreeEntry};
 use crate::git_panel::GitPanel;
+use crate::git_panel_settings::GitPanelSettings;
 
 actions!(
     git,
@@ -87,7 +89,10 @@ pub struct CommitView {
     remote: Option<GitRemote>,
     is_shallow_boundary: bool,
     file_filter: Option<RepoPath>,
+    file_tree: Entity<DiffFileTree>,
+    pending_scroll: Option<PathKey>,
     _load_diff_task: Task<Result<()>>,
+    _subscriptions: Vec<Subscription>,
 }
 
 pub(crate) struct GitBlob {
@@ -178,6 +183,24 @@ impl Addon for CommitDiffAddon {
 }
 
 const FILE_NAMESPACE_SORT_PREFIX: u64 = 1;
+
+fn commit_file_path_key(path: &RelPath) -> PathKey {
+    PathKey::with_sort_prefix(FILE_NAMESPACE_SORT_PREFIX, path.into_arc())
+}
+
+fn commit_file_status(is_created: bool, is_deleted: bool) -> FileStatus {
+    let status_code = if is_created {
+        StatusCode::Added
+    } else if is_deleted {
+        StatusCode::Deleted
+    } else {
+        StatusCode::Modified
+    };
+    FileStatus::Tracked(TrackedStatus {
+        index_status: status_code,
+        worktree_status: StatusCode::Unmodified,
+    })
+}
 
 impl CommitView {
     pub fn open(
@@ -349,6 +372,24 @@ impl CommitView {
         let repository_clone = repository.clone();
         let project_clone = project.clone();
 
+        let file_tree_entries = commit_diff
+            .files
+            .iter()
+            .map(|file| DiffFileTreeEntry {
+                repo_path: file.path.clone(),
+                status: commit_file_status(file.old_text.is_none(), file.new_text.is_none()),
+                path_key: commit_file_path_key(&file.path),
+            })
+            .collect();
+        let (file_tree, subscriptions) = Self::new_file_tree(
+            file_tree_entries,
+            &editor,
+            &multibuffer,
+            &project,
+            window,
+            cx,
+        );
+
         let load_diff_task = cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
             let mut file_statuses: HashMap<language::BufferId, FileStatus> = HashMap::default();
@@ -387,6 +428,7 @@ impl CommitView {
                     .unwrap_or_else(|| file.path.display(PathStyle::local()).to_string());
                 let display_name = format!("{short_sha} - {file_name}");
 
+                let path = commit_file_path_key(&file.path);
                 let file = Arc::new(GitBlob {
                     path: file.path.clone(),
                     is_deleted,
@@ -398,20 +440,7 @@ impl CommitView {
                 let buffer = build_buffer(new_text, file, &language_registry, cx).await?;
                 let buffer_id = cx.update(|_, cx| buffer.read(cx).remote_id())?;
 
-                let status_code = if is_created {
-                    StatusCode::Added
-                } else if is_deleted {
-                    StatusCode::Deleted
-                } else {
-                    StatusCode::Modified
-                };
-                file_statuses.insert(
-                    buffer_id,
-                    FileStatus::Tracked(TrackedStatus {
-                        index_status: status_code,
-                        worktree_status: StatusCode::Unmodified,
-                    }),
-                );
+                file_statuses.insert(buffer_id, commit_file_status(is_created, is_deleted));
 
                 if is_binary {
                     binary_buffer_ids.insert(buffer_id);
@@ -433,13 +462,9 @@ impl CommitView {
                     build_buffer_diff(old_text, &buffer, &language_registry, cx).await?
                 };
 
-                let (excerpt_ranges, path) = cx.update(|_, cx| {
+                let excerpt_ranges = cx.update(|_, cx| {
                     let snapshot = buffer.read(cx).snapshot();
-                    let path = PathKey::with_sort_prefix(
-                        FILE_NAMESPACE_SORT_PREFIX,
-                        snapshot.file().unwrap().path().clone(),
-                    );
-                    let ranges = if is_binary {
+                    if is_binary {
                         vec![language::Point::zero()..snapshot.max_point()]
                     } else {
                         let diff_snapshot = buffer_diff.read(cx).snapshot(cx);
@@ -451,8 +476,7 @@ impl CommitView {
                                 .map(|hunk| hunk.buffer_range.to_point(&snapshot))
                                 .collect::<Vec<_>>()
                         }
-                    };
-                    (ranges, path)
+                    }
                 })?;
 
                 // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
@@ -535,8 +559,85 @@ impl CommitView {
             remote,
             is_shallow_boundary,
             file_filter,
+            file_tree,
+            pending_scroll: None,
             _load_diff_task: load_diff_task,
+            _subscriptions: subscriptions,
         }
+    }
+
+    fn new_file_tree(
+        entries: Vec<DiffFileTreeEntry>,
+        editor: &Entity<SplittableEditor>,
+        multibuffer: &Entity<MultiBuffer>,
+        project: &Entity<Project>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<DiffFileTree>, Vec<Subscription>) {
+        let file_tree = cx.new(|cx| {
+            let mut file_tree = DiffFileTree::new(project.read(cx).path_style(cx), cx);
+            file_tree.set_entries(entries, cx);
+            file_tree
+        });
+        let subscriptions = vec![
+            diff_file_tree::subscribe(&file_tree, editor, window, cx, Self::move_to_path),
+            // Large commits add their files in batches, so a file picked in
+            // the tree before its excerpt exists is scrolled to once it does.
+            cx.observe_in(multibuffer, window, |this, _multibuffer, window, cx| {
+                if let Some(path_key) = this.pending_scroll.take() {
+                    this.move_to_path(path_key, window, cx);
+                }
+            }),
+            cx.observe_global_in::<SettingsStore>(window, {
+                let mut was_enabled = GitPanelSettings::get_global(cx).diff_file_tree;
+                move |this, window, cx| {
+                    let is_enabled = GitPanelSettings::get_global(cx).diff_file_tree;
+                    if is_enabled == was_enabled {
+                        return;
+                    }
+                    was_enabled = is_enabled;
+                    diff_file_tree::sync_focus(
+                        &this.file_tree,
+                        this.shows_file_tree(cx),
+                        &this.editor.focus_handle(cx),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                }
+            }),
+        ];
+        (file_tree, subscriptions)
+    }
+
+    fn move_to_path(&mut self, path_key: PathKey, window: &mut Window, cx: &mut Context<Self>) {
+        if diff_file_tree::scroll_editor_to_path(&self.editor, &path_key, window, cx) {
+            self.pending_scroll = None;
+        } else {
+            self.pending_scroll = Some(path_key);
+        }
+    }
+
+    fn has_file_tree(&self, cx: &App) -> bool {
+        self.file_filter.is_none() && self.file_tree.read(cx).file_count() > 1
+    }
+
+    fn shows_file_tree(&self, cx: &App) -> bool {
+        self.has_file_tree(cx) && GitPanelSettings::get_global(cx).diff_file_tree
+    }
+
+    fn toggle_file_tree_focus(
+        &mut self,
+        _: &diff_file_tree::ToggleFocus,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // The tree is only rendered once the commit's first file has loaded.
+        if !self.has_file_tree(cx) || self.editor.read(cx).rhs_editor().read(cx).is_empty(cx) {
+            cx.propagate();
+            return;
+        }
+        diff_file_tree::toggle_focus(&self.file_tree, &self.editor.focus_handle(cx), window, cx);
     }
 
     fn render_shallow_boundary_notice(&self, cx: &App) -> impl IntoElement {
@@ -1338,6 +1439,7 @@ impl Item for CommitView {
                 let project = project.clone();
                 let workspace_entity = workspace_entity.clone();
                 let multibuffer = multibuffer.clone();
+                let window = &mut *window;
                 move |cx| {
                     let editor = SplittableEditor::new(
                         diff_view_style,
@@ -1360,6 +1462,15 @@ impl Item for CommitView {
                     editor
                 }
             });
+            let file_tree_entries = self.file_tree.read(cx).entries().to_vec();
+            let (file_tree, subscriptions) = Self::new_file_tree(
+                file_tree_entries,
+                &editor,
+                &multibuffer,
+                &self.project,
+                window,
+                cx,
+            );
             let language_registry = project.read(cx).languages().clone();
             let message = cx.new(|cx| {
                 Markdown::new(
@@ -1383,7 +1494,10 @@ impl Item for CommitView {
                 remote: self.remote.clone(),
                 is_shallow_boundary: self.is_shallow_boundary,
                 file_filter: self.file_filter.clone(),
+                file_tree,
+                pending_scroll: None,
                 _load_diff_task: Task::ready(Ok(())),
+                _subscriptions: subscriptions,
             }
         })))
     }
@@ -1392,16 +1506,35 @@ impl Item for CommitView {
 impl Render for CommitView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let is_stash = self.stash.is_some();
+        let mut key_context = KeyContext::default();
+        key_context.add(if is_stash { "StashDiff" } else { "CommitDiff" });
+        if self.has_file_tree(cx) {
+            diff_file_tree::add_key_context(&mut key_context, self.shows_file_tree(cx));
+        }
 
         v_flex()
-            .key_context(if is_stash { "StashDiff" } else { "CommitDiff" })
+            .key_context(key_context)
             .on_action(cx.listener(Self::open_file_at_head_action))
+            .on_action(cx.listener(Self::toggle_file_tree_focus))
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .child(self.render_header(window, cx))
             .when(
                 !self.editor.read(cx).rhs_editor().read(cx).is_empty(cx),
-                |this| this.child(div().flex_grow(1.).child(self.editor.clone())),
+                |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_grow(1.)
+                            .min_h_0()
+                            .w_full()
+                            .when(self.shows_file_tree(cx), |this| {
+                                this.child(DiffFileTree::cached_view(self.file_tree.clone(), cx))
+                            })
+                            .child(div().flex_grow(1.).min_w_0().child(self.editor.clone())),
+                    )
+                },
             )
             .when(self.is_shallow_boundary, |this| {
                 this.child(self.render_shallow_boundary_notice(cx))
@@ -1449,6 +1582,8 @@ impl Render for CommitViewToolbar {
         });
 
         let sha_for_graph = commit_sha.to_string();
+        let has_file_tree = commit_view_ref.has_file_tree(cx);
+        let focus_handle = commit_view_ref.focus_handle(cx);
 
         h_flex()
             .gap_1()
@@ -1463,6 +1598,9 @@ impl Render for CommitViewToolbar {
                         ))
                         .child(Divider::vertical()),
                 )
+            })
+            .when(has_file_tree, |this| {
+                this.child(diff_file_tree::render_toggle_button(&focus_handle, cx))
             })
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)
@@ -1545,7 +1683,98 @@ mod tests {
     use gpui::{EmptyView, TestAppContext};
     use indoc::indoc;
     use language::{Language, LanguageConfig, LanguageMatcher, markdown_lang};
+    use multi_buffer::ToPoint as _;
+    use project::{FakeFs, git_store::CommitFile};
+    use serde_json::json;
     use settings::SettingsStore;
+    use util::path;
+    use workspace::MultiWorkspace;
+
+    #[gpui::test]
+    async fn test_file_tree_scrolls_to_file_loaded_after_click(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            crate::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        cx.run_until_parked();
+        let repository = project
+            .read_with(cx, |project, cx| project.active_repository(cx))
+            .expect("project has a repository");
+
+        let files = (0..3)
+            .map(|ix| CommitFile {
+                path: RepoPath::new(&format!("file{ix}.txt")).unwrap(),
+                old_text: Some("old\n".into()),
+                new_text: Some("new\n".into()),
+                is_binary: false,
+            })
+            .collect();
+        let commit = CommitDetails {
+            sha: "a".repeat(40).into(),
+            message: "message".into(),
+            commit_timestamp: 0,
+            author_email: "author@example.com".into(),
+            author_name: "Author".into(),
+        };
+        let commit_view = workspace.update_in(cx, |_workspace, window, cx| {
+            let workspace_entity = cx.entity();
+            let workspace = cx.weak_entity();
+            cx.new(|cx| {
+                CommitView::new(
+                    commit,
+                    CommitDiff {
+                        files,
+                        is_shallow_boundary: false,
+                    },
+                    repository,
+                    project.clone(),
+                    workspace_entity,
+                    workspace,
+                    None,
+                    None,
+                    window,
+                    cx,
+                )
+            })
+        });
+
+        let file_tree = commit_view.read_with(cx, |commit_view, _| commit_view.file_tree.clone());
+        file_tree.update(cx, |file_tree, cx| file_tree.open_path("file2.txt", cx));
+        cx.run_until_parked();
+
+        commit_view.read_with(cx, |commit_view, cx| {
+            let path_key = commit_file_path_key(&RepoPath::new("file2.txt").unwrap());
+            let snapshot = commit_view.multibuffer.read(cx).snapshot(cx);
+            let file_start = commit_view
+                .multibuffer
+                .read(cx)
+                .location_for_path(&path_key, cx)
+                .expect("file2.txt has been loaded")
+                .to_point(&snapshot);
+            let cursor = commit_view
+                .editor
+                .read(cx)
+                .rhs_editor()
+                .read(cx)
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot);
+            assert_eq!(cursor, file_start);
+        });
+    }
 
     #[gpui::test]
     async fn test_build_buffer_resolves_injected_languages(cx: &mut TestAppContext) {

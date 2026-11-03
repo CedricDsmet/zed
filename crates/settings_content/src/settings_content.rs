@@ -802,6 +802,11 @@ pub struct GitPanelSettingsContent {
     /// Default: true
     pub diff_stats: Option<bool>,
 
+    /// Whether to show a file tree next to branch and commit diffs.
+    ///
+    /// Default: true
+    pub diff_file_tree: Option<bool>,
+
     /// Whether to show a badge on the git panel icon with the count of uncommitted changes.
     ///
     /// Default: false

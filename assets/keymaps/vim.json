@@ -1162,6 +1162,40 @@
     },
   },
   {
+    "context": "diff_file_tree_visible > Editor && VimControl && !menu",
+    "bindings": {
+      "ctrl-w h": "diff_file_tree::ToggleFocus",
+      "ctrl-w ctrl-h": "diff_file_tree::ToggleFocus",
+      "ctrl-w left": "diff_file_tree::ToggleFocus",
+    },
+  },
+  {
+    "context": "DiffFileTree",
+    "bindings": {
+      "h": "diff_file_tree::CollapseSelectedEntry",
+      "j": "vim::MenuSelectNext",
+      "k": "vim::MenuSelectPrevious",
+      "down": "vim::MenuSelectNext",
+      "up": "vim::MenuSelectPrevious",
+      "l": "diff_file_tree::ExpandSelectedEntry",
+      "shift-g": "menu::SelectLast",
+      "g g": "menu::SelectFirst",
+      "ctrl-w l": "diff_file_tree::ToggleFocus",
+      "ctrl-w ctrl-l": "diff_file_tree::ToggleFocus",
+      "ctrl-w right": "diff_file_tree::ToggleFocus",
+      "0": ["vim::Number", 0],
+      "1": ["vim::Number", 1],
+      "2": ["vim::Number", 2],
+      "3": ["vim::Number", 3],
+      "4": ["vim::Number", 4],
+      "5": ["vim::Number", 5],
+      "6": ["vim::Number", 6],
+      "7": ["vim::Number", 7],
+      "8": ["vim::Number", 8],
+      "9": ["vim::Number", 9],
+    },
+  },
+  {
     "context": "Editor && mode == auto_height && VimControl",
     "bindings": {
       // TODO: Implement search

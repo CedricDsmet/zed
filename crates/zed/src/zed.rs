@@ -6229,6 +6229,7 @@ mod tests {
                 "debugger",
                 "dev",
                 "diagnostics",
+                "diff_file_tree",
                 "edit_prediction",
                 "editor",
                 "encoding_selector",

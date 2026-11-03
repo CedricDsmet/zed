@@ -961,49 +961,14 @@ impl TreeViewState {
 
         entries.sort_by(|a, b| a.repo_path.cmp(&b.repo_path));
 
-        let mut root = TreeNode::default();
-        for entry in entries {
-            let components: Vec<&str> = entry.repo_path.components().collect();
-            if components.is_empty() {
-                root.files.push(entry);
-                continue;
-            }
-
-            let mut current = &mut root;
-            let mut current_path = String::new();
-
-            for (ix, component) in components.iter().enumerate() {
-                if ix == components.len() - 1 {
-                    current.files.push(entry.clone());
-                } else {
-                    if !current_path.is_empty() {
-                        current_path.push('/');
-                    }
-                    current_path.push_str(component);
-                    let dir_path = RepoPath::new(&current_path)
-                        .expect("repo path from status entry component");
-
-                    let component = SharedString::from(component.to_string());
-
-                    current = current
-                        .children
-                        .entry(component.clone())
-                        .or_insert_with(|| TreeNode {
-                            name: component,
-                            path: Some(dir_path),
-                            ..Default::default()
-                        });
-                }
-            }
-        }
-
+        let root = TreeNode::build(entries, |entry| &entry.repo_path);
         let (flattened, _) = self.flatten_tree(&root, section, 0, seen_directories);
         flattened
     }
 
     fn flatten_tree(
         &mut self,
-        node: &TreeNode,
+        node: &TreeNode<GitStatusEntry>,
         section: Section,
         depth: usize,
         seen_directories: &mut HashSet<TreeKey>,
@@ -1012,8 +977,8 @@ impl TreeViewState {
         let mut flattened = Vec::new();
 
         for child in node.children.values() {
-            let (terminal, name) = Self::compact_directory_chain(child);
-            let Some(path) = terminal.path.clone().or_else(|| child.path.clone()) else {
+            let (terminal, name, path) = child.compact_directory_chain();
+            let Some(path) = path else {
                 continue;
             };
             let (child_flattened, mut child_statuses) =
@@ -1058,22 +1023,6 @@ impl TreeViewState {
 
         (flattened, all_statuses)
     }
-
-    fn compact_directory_chain(mut node: &TreeNode) -> (&TreeNode, SharedString) {
-        let mut parts = vec![node.name.clone()];
-        while node.files.is_empty() && node.children.len() == 1 {
-            let Some(child) = node.children.values().next() else {
-                continue;
-            };
-            if child.path.is_none() {
-                break;
-            }
-            parts.push(child.name.clone());
-            node = child;
-        }
-        let name = parts.join("/");
-        (node, SharedString::from(name))
-    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -1099,12 +1048,80 @@ struct GitTreeDirEntry {
     expanded: bool,
 }
 
-#[derive(Default)]
-struct TreeNode {
+/// Files grouped by directory, shared by the Git panel's tree view and the
+/// diff file tree so both lists group and compact directories alike.
+pub(crate) struct TreeNode<T> {
     name: SharedString,
     path: Option<RepoPath>,
-    children: BTreeMap<SharedString, TreeNode>,
-    files: Vec<GitStatusEntry>,
+    pub(crate) children: BTreeMap<SharedString, TreeNode<T>>,
+    pub(crate) files: Vec<T>,
+}
+
+impl<T> Default for TreeNode<T> {
+    fn default() -> Self {
+        Self {
+            name: SharedString::default(),
+            path: None,
+            children: BTreeMap::new(),
+            files: Vec::new(),
+        }
+    }
+}
+
+impl<T> TreeNode<T> {
+    pub(crate) fn build(
+        items: impl IntoIterator<Item = T>,
+        repo_path: impl Fn(&T) -> &RepoPath,
+    ) -> Self {
+        let mut root = Self::default();
+        for item in items {
+            let mut node = &mut root;
+            if let Some(parent) = repo_path(&item).parent() {
+                let mut dir_path = String::new();
+                for component in parent.components() {
+                    if !dir_path.is_empty() {
+                        dir_path.push('/');
+                    }
+                    dir_path.push_str(component);
+                    let name = SharedString::from(component.to_string());
+                    node = node
+                        .children
+                        .entry(name.clone())
+                        .or_insert_with(|| TreeNode {
+                            name,
+                            path: RepoPath::new(&dir_path).log_err(),
+                            ..Default::default()
+                        });
+                }
+            }
+            node.files.push(item);
+        }
+        root
+    }
+
+    pub(crate) fn path(&self) -> Option<&RepoPath> {
+        self.path.as_ref()
+    }
+
+    /// Follows directories holding nothing but a single subdirectory, so they
+    /// can be shown as one row ("a/b/c"). Returns the last directory of the
+    /// chain, the row's name, and the last directory's path.
+    pub(crate) fn compact_directory_chain(&self) -> (&Self, SharedString, Option<RepoPath>) {
+        let mut node = self;
+        let mut parts = vec![node.name.clone()];
+        while node.files.is_empty() && node.children.len() == 1 {
+            let Some(child) = node.children.values().next() else {
+                break;
+            };
+            if child.path.is_none() {
+                break;
+            }
+            parts.push(child.name.clone());
+            node = child;
+        }
+        let path = node.path.clone().or_else(|| self.path.clone());
+        (node, SharedString::from(parts.join("/")), path)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

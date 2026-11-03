@@ -6198,6 +6198,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
     "starts_open": false,
     "show_count_badge": false,
     "diff_stats": true,
+    "diff_file_tree": true,
     "commit_title_max_length": 0,
     "entry_primary_click_action": "project_diff"
   }
@@ -6222,6 +6223,7 @@ See the [debugger page](../debugger.md) for more information about debugging sup
 - `commit_editor`: Whether the commit message editor is shown in the git panel by default. Can be `expanded` or `collapsed`
 - `show_count_badge`: Whether to show a badge on the git panel icon with the count of uncommitted changes
 - `diff_stats`: Whether to show the addition/deletion change count next to each file in the git panel
+- `diff_file_tree`: Whether to show a file tree next to branch and commit diffs
 - `commit_title_max_length`: Maximum length of the commit message title before a warning is shown. Set to `0` to disable
 - `entry_primary_click_action`: Default action when clicking a changed file in the git panel. Can be `project_diff`, `file_diff`, or `view_file`
 

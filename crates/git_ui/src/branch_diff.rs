@@ -1,5 +1,5 @@
 use crate::{
-    branch_picker,
+    branch_picker, diff_file_tree,
     diff_multibuffer::DiffMultibuffer,
     project_diff::{
         self, CompareWithBranch, DeployBranchDiff, ProjectDiff, ReviewDiff,
@@ -333,7 +333,7 @@ impl BranchDiff {
         });
         let branch_diff_for_addon = branch_diff.clone();
         let diff = cx.new(|cx| {
-            DiffMultibuffer::new(
+            let mut diff = DiffMultibuffer::new(
                 branch_diff,
                 Capability::ReadWrite,
                 "No changes",
@@ -350,7 +350,9 @@ impl BranchDiff {
                 workspace.clone(),
                 window,
                 cx,
-            )
+            );
+            diff.show_file_tree(window, cx);
+            diff
         });
         Self::from_diff(diff, project, workspace, cx)
     }
@@ -814,6 +816,8 @@ impl Render for BranchDiffToolbar {
                 ))
             })
             .child(Divider::vertical().ml_1())
+            .child(diff_file_tree::render_toggle_button(&focus_handle, cx))
+            .child(Divider::vertical())
             .child(
                 PopoverMenu::new("branch-diff-base-branch-picker")
                     .menu(move |window, cx| {
@@ -909,11 +913,12 @@ impl Render for BranchDiffToolbar {
 
 #[cfg(test)]
 mod tests {
+    use crate::git_panel_settings::GitPanelSettings;
     use anyhow::anyhow;
     use collections::HashMap;
     use editor::test::editor_test_context::assert_state_with_diff;
     use git::status::{FileStatus, TrackedStatus, UnmergedStatus, UnmergedStatusCode};
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
     use project::FakeFs;
     use serde_json::json;
     use settings::{DiffViewStyle, SettingsStore};
@@ -1193,6 +1198,303 @@ mod tests {
                 )
             ])
         );
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_file_tree_navigates_to_file(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed\n",
+                "src": {
+                    "b.txt": "new\n",
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace, window, cx)
+            })
+            .await
+            .unwrap();
+        cx.run_until_parked();
+
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+        );
+        cx.run_until_parked();
+
+        let file_tree = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).file_tree().cloned().unwrap()
+        });
+        let mut paths = file_tree.read_with(cx, |file_tree, _| file_tree.entry_paths());
+        paths.sort();
+        assert_eq!(paths, vec!["a.txt", "src/b.txt"]);
+
+        file_tree.update(cx, |file_tree, cx| file_tree.open_path("src/b.txt", cx));
+        cx.run_until_parked();
+
+        let active_path = diff.read_with(cx, |diff, cx| {
+            diff.diff
+                .read(cx)
+                .active_project_path(cx)
+                .map(|project_path| project_path.path)
+        });
+        assert_eq!(active_path, Some(rel_path("src/b.txt").into_arc()));
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_file_tree_keyboard_navigation(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().tree_view = Some(true);
+                });
+            });
+            cx.bind_keys([
+                gpui::KeyBinding::new("j", menu::SelectNext, Some("DiffFileTree")),
+                gpui::KeyBinding::new(
+                    "l",
+                    diff_file_tree::ExpandSelectedEntry,
+                    Some("DiffFileTree"),
+                ),
+                gpui::KeyBinding::new(
+                    "h",
+                    diff_file_tree::CollapseSelectedEntry,
+                    Some("DiffFileTree"),
+                ),
+                gpui::KeyBinding::new(
+                    "ctrl-w h",
+                    diff_file_tree::ToggleFocus,
+                    Some("diff_file_tree_visible > Editor"),
+                ),
+            ]);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed\n",
+                "src": {
+                    "b.txt": "new b\n",
+                    "c.txt": "new c\n",
+                },
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+        );
+        cx.run_until_parked();
+
+        let file_tree = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).file_tree().cloned().unwrap()
+        });
+        let file_tree_focus = file_tree.read_with(cx, |file_tree, cx| file_tree.focus_handle(cx));
+        let editor_focus = diff.read_with(cx, |diff, cx| diff.diff.read(cx).focus_handle(cx));
+        let selected_path = |cx: &mut VisualTestContext| {
+            file_tree.read_with(cx, |file_tree, _| file_tree.selected_path())
+        };
+        let active_path = |cx: &mut VisualTestContext| {
+            diff.read_with(cx, |diff, cx| {
+                diff.diff
+                    .read(cx)
+                    .active_project_path(cx)
+                    .map(|project_path| project_path.path.as_unix_str().to_string())
+            })
+        };
+
+        cx.update(|window, cx| editor_focus.focus(window, cx));
+        cx.simulate_keystrokes("ctrl-w h");
+        cx.run_until_parked();
+        assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+
+        cx.simulate_keystrokes("j j");
+        assert_eq!(selected_path(cx).as_deref(), Some("src/b.txt"));
+
+        cx.simulate_keystrokes("h");
+        assert_eq!(selected_path(cx).as_deref(), Some("src"));
+        cx.simulate_keystrokes("h j");
+        assert_eq!(selected_path(cx).as_deref(), Some("src"));
+
+        cx.dispatch_action(menu::SelectPrevious);
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+        cx.dispatch_action(menu::SelectNext);
+        cx.simulate_keystrokes("l l");
+        assert_eq!(selected_path(cx).as_deref(), Some("src/b.txt"));
+        cx.dispatch_action(menu::SelectNext);
+        assert_eq!(selected_path(cx).as_deref(), Some("src/c.txt"));
+
+        cx.simulate_keystrokes("l");
+        cx.run_until_parked();
+        assert_eq!(active_path(cx).as_deref(), Some("src/c.txt"));
+        assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+
+        cx.dispatch_action(menu::SelectFirst);
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+        cx.dispatch_action(menu::Confirm);
+        cx.run_until_parked();
+        assert_eq!(active_path(cx).as_deref(), Some("a.txt"));
+        assert!(cx.update(|window, cx| editor_focus.contains_focused(window, cx)));
+
+        cx.dispatch_action(diff_file_tree::ToggleFocus);
+        assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+        assert_eq!(selected_path(cx).as_deref(), Some("a.txt"));
+        cx.dispatch_action(diff_file_tree::ToggleFocus);
+        assert!(cx.update(|window, cx| editor_focus.contains_focused(window, cx)));
+
+        cx.dispatch_action(diff_file_tree::ToggleFocus);
+        cx.dispatch_action(menu::Cancel);
+        assert!(cx.update(|window, cx| editor_focus.contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_file_tree_toggle_focus_waits_for_hidden_tree(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            cx.update_global::<SettingsStore, _>(|store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.git_panel.get_or_insert_default().diff_file_tree = Some(false);
+                });
+            });
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "changed\n",
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "original\n".into())],
+        );
+        cx.run_until_parked();
+
+        let file_tree = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).file_tree().cloned().unwrap()
+        });
+        let file_tree_focus = file_tree.read_with(cx, |file_tree, cx| file_tree.focus_handle(cx));
+        let editor_focus = diff.read_with(cx, |diff, cx| diff.diff.read(cx).focus_handle(cx));
+        cx.update(|window, cx| editor_focus.focus(window, cx));
+
+        cx.update(|window, cx| diff_file_tree::toggle_focus(&file_tree, &editor_focus, window, cx));
+        assert!(cx.update(|window, cx| editor_focus.contains_focused(window, cx)));
+
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| GitPanelSettings::get_global(cx).diff_file_tree));
+        assert!(cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+    }
+
+    #[gpui::test]
+    async fn test_branch_diff_file_tree_toggle_focus_ignored_without_changes(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/project"), json!({ ".git": {}, "a.txt": "a\n" }))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/project").as_ref()], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx
+            .update(|window, cx| {
+                BranchDiff::new_with_default_branch(project.clone(), workspace.clone(), window, cx)
+            })
+            .await
+            .unwrap();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(diff.clone()), None, true, window, cx);
+        });
+        fs.set_head_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "a\n".into())],
+            "sha",
+        );
+        fs.set_merge_base_content_for_repo(
+            Path::new(path!("/project/.git")),
+            &[("a.txt", "a\n".into())],
+        );
+        cx.run_until_parked();
+        assert!(diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).excerpt_paths(cx).is_empty()
+        }));
+
+        let file_tree = diff.read_with(cx, |diff, cx| {
+            diff.diff.read(cx).file_tree().cloned().unwrap()
+        });
+        let file_tree_focus = file_tree.read_with(cx, |file_tree, cx| file_tree.focus_handle(cx));
+        let diff_focus = diff.read_with(cx, |diff, cx| diff.diff.read(cx).focus_handle(cx));
+        cx.update(|window, cx| diff_focus.focus(window, cx));
+
+        cx.dispatch_action(diff_file_tree::ToggleFocus);
+        assert!(!cx.update(|window, cx| file_tree_focus.contains_focused(window, cx)));
+        assert!(cx.update(|window, cx| diff_focus.contains_focused(window, cx)));
     }
 
     #[gpui::test]
